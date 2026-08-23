@@ -1,0 +1,22 @@
+{
+    "1495474622190321936": 1039,
+    "1495474622190321936_fishing": {
+        "rod": "basic",
+        "cooldown_level": 0,
+        "total_caught": 1,
+        "total_earned": 39,
+        "biggest_catch": 39,
+        "biggest_catch_name": "Forelle",
+        "legendary_caught": 0,
+        "last_fish_time": 1787153681.499413,
+        "bait": 0,
+        "inventory": {
+            "Forelle": {
+                "emoji": "🐠",
+                "count": 1,
+                "total_value": 39,
+                "rarity": "uncommon"
+            }
+        }
+    }
+}

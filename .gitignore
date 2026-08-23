@@ -1,0 +1,36 @@
+# Security / Secrets
+.env
+*.pem
+*.key
+
+# Python Virtual Environments
+venv/
+env/
+.venv/
+ENV/
+
+# Python Cache & Bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# OS-spezifische Dateien (Linux, macOS, Windows)
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# IDE / Editor Konfigurationen
+.vscode/
+.idea/
+
+# Bot / Projekt Logs & Datenbanken
+*.log
+logs/
+*.sqlite3
+*.db
+
+# Node.js (falls du Discord.js oder Frontend-Tools nutzt)
+node_modules/
+npm-debug.log*

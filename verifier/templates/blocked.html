@@ -1,0 +1,33 @@
+{% extends "base.html" %}
+{% block title %}Zugang verweigert — ByGorgii{% endblock %}
+{% block content %}
+<div class="page-center" style="text-align:center;padding-top:70px">
+
+  <div style="width:80px;height:80px;border-radius:50%;background:rgba(239,68,68,.12);border:1px solid rgba(239,68,68,.25);display:flex;align-items:center;justify-content:center;margin:0 auto 24px">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="1.5" style="width:36px;height:36px"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+  </div>
+
+  <h1 style="font-size:1.8rem;font-weight:800;margin-bottom:10px;color:#ef4444">Zugang verweigert</h1>
+
+  {% if reason == "alt_account" %}
+    <p style="font-size:.95rem;color:var(--t2);line-height:1.7;margin-bottom:20px">
+      Dein Account wurde als <strong style="color:var(--t1)">Alt-Account</strong> eines gesperrten Nutzers erkannt.<br>
+      Dein Zugang wurde automatisch gesperrt.
+    </p>
+    <div class="alert alert-error" style="text-align:left;margin-bottom:20px">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+      <span>Unser System hat erkannt, dass diese Verbindung bereits mit einem gesperrten Account verknüpft ist.</span>
+    </div>
+  {% else %}
+    <p style="font-size:.95rem;color:var(--t2);line-height:1.7;margin-bottom:20px">
+      Dein Account wurde von einem Administrator <strong style="color:var(--t1)">gesperrt</strong>.<br>
+      Du hast keinen Zugang zu diesem Server.
+    </p>
+  {% endif %}
+
+  <p style="font-size:.82rem;color:var(--t3);line-height:1.6">
+    Wenn du der Meinung bist, dass dies ein Fehler ist, wende dich an die Serveradministration.
+  </p>
+
+</div>
+{% endblock %}

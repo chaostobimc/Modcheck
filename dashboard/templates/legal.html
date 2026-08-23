@@ -1,0 +1,224 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{% block title %}{% endblock %} — ByGorgii</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+<style>
+  .legal-page {
+    min-height: 100vh;
+    background: var(--bg);
+    background-image: radial-gradient(ellipse at 50% 0%, rgba(99,102,241,.06) 0%, transparent 60%);
+  }
+  .legal-nav {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 18px 40px;
+    border-bottom: 1px solid var(--border);
+    background: var(--s1);
+    position: sticky;
+    top: 0;
+    z-index: 50;
+  }
+  .legal-nav-brand {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: .9rem;
+    font-weight: 700;
+    color: var(--t1);
+  }
+  .legal-nav-brand-icon {
+    width: 30px; height: 30px;
+    border-radius: 8px;
+    background: var(--blue-glow);
+    border: 1px solid var(--blue-ring);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .legal-nav-brand-icon svg { width: 14px; height: 14px; color: var(--blue2); }
+  .legal-nav-links {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .legal-nav-link {
+    padding: 6px 14px;
+    border-radius: 6px;
+    font-size: .8rem;
+    font-weight: 500;
+    color: var(--t2);
+    transition: background .12s, color .12s;
+  }
+  .legal-nav-link:hover { background: var(--s3); color: var(--t1); }
+  .legal-nav-link.active { background: var(--blue-glow); color: var(--blue2); }
+
+  .legal-content {
+    max-width: 760px;
+    margin: 0 auto;
+    padding: 56px 24px 80px;
+  }
+  .legal-header {
+    margin-bottom: 40px;
+  }
+  .legal-tag {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: .72rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: .08em;
+    color: var(--blue2);
+    background: var(--blue-glow);
+    border: 1px solid var(--blue-ring);
+    padding: 4px 10px;
+    border-radius: 20px;
+    margin-bottom: 16px;
+  }
+  .legal-tag svg { width: 11px; height: 11px; }
+  .legal-title {
+    font-size: 2rem;
+    font-weight: 800;
+    letter-spacing: -.03em;
+    line-height: 1.15;
+    margin-bottom: 12px;
+  }
+  .legal-meta {
+    font-size: .8rem;
+    color: var(--t3);
+  }
+  .legal-divider {
+    height: 1px;
+    background: var(--border);
+    margin: 32px 0;
+  }
+  .legal-section {
+    margin-bottom: 36px;
+  }
+  .legal-h2 {
+    font-size: 1.05rem;
+    font-weight: 700;
+    margin-bottom: 12px;
+    color: var(--t1);
+    display: flex;
+    align-items: center;
+    gap: 8px;
+  }
+  .legal-h2::before {
+    content: '';
+    display: block;
+    width: 3px;
+    height: 18px;
+    border-radius: 2px;
+    background: var(--blue);
+    flex-shrink: 0;
+  }
+  .legal-p {
+    font-size: .85rem;
+    color: var(--t2);
+    line-height: 1.8;
+    margin-bottom: 10px;
+  }
+  .legal-p a { color: var(--blue2); }
+  .legal-p a:hover { text-decoration: underline; }
+  .legal-ul {
+    list-style: none;
+    margin: 8px 0 12px;
+  }
+  .legal-ul li {
+    font-size: .85rem;
+    color: var(--t2);
+    line-height: 1.7;
+    padding-left: 18px;
+    position: relative;
+  }
+  .legal-ul li::before {
+    content: '–';
+    position: absolute;
+    left: 0;
+    color: var(--t3);
+  }
+  .legal-box {
+    background: var(--s2);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 16px 20px;
+    margin: 16px 0;
+  }
+  .legal-box p {
+    font-size: .82rem;
+    color: var(--t2);
+    line-height: 1.7;
+  }
+  .legal-highlight {
+    background: var(--blue-glow);
+    border: 1px solid var(--blue-ring);
+    border-radius: 8px;
+    padding: 14px 18px;
+    margin: 16px 0;
+    font-size: .82rem;
+    color: var(--blue2);
+    line-height: 1.6;
+  }
+  .legal-footer {
+    margin-top: 60px;
+    padding-top: 28px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    flex-wrap: wrap;
+    gap: 12px;
+  }
+  .legal-footer-links {
+    display: flex;
+    gap: 16px;
+  }
+  .legal-footer-link {
+    font-size: .76rem;
+    color: var(--t3);
+    transition: color .15s;
+  }
+  .legal-footer-link:hover { color: var(--t2); }
+  .legal-footer-copy {
+    font-size: .76rem;
+    color: var(--t3);
+  }
+</style>
+</head>
+<body class="legal-page">
+
+<nav class="legal-nav">
+  <a href="/" class="legal-nav-brand" style="text-decoration:none">
+    <div class="legal-nav-brand-icon">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+    </div>
+    ByGorgii
+  </a>
+  <div class="legal-nav-links">
+    <a href="{{ url_for('_tos') }}" class="legal-nav-link{% if request.endpoint=='_tos' %} active{% endif %}">Nutzungsbedingungen</a>
+    <a href="{{ url_for('_privacy') }}" class="legal-nav-link{% if request.endpoint=='_privacy' %} active{% endif %}">Datenschutz</a>
+  </div>
+</nav>
+
+<div class="legal-content">
+  {% block content %}{% endblock %}
+
+  <div class="legal-footer">
+    <div class="legal-footer-links">
+      <a href="{{ url_for('_tos') }}" class="legal-footer-link">Nutzungsbedingungen</a>
+      <a href="{{ url_for('_privacy') }}" class="legal-footer-link">Datenschutzerklärung</a>
+    </div>
+    <div class="legal-footer-copy">© {{ now.year }} ByGorgii Community</div>
+  </div>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Setup – ByGorgii Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
+</head>
+<body>
+<div class="login-page">
+  <div class="login-box">
+    <div style="width:72px;height:72px;border-radius:50%;background:rgba(250,166,26,.15);margin:0 auto 20px;display:flex;align-items:center;justify-content:center;">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#faa61a" stroke-width="1.5" style="width:32px;height:32px;">
+        <circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/>
+      </svg>
+    </div>
+
+    <div class="login-title">Setup erforderlich</div>
+    <div class="login-sub" style="margin-bottom:20px;">
+      OAuth2 ist noch nicht konfiguriert. Füge diese Variablen in deine <code style="background:var(--bg-hover);padding:1px 5px;border-radius:3px;font-size:.8rem;">.env</code> ein:
+    </div>
+
+    <div style="background:var(--bg-base);border:1px solid var(--border);border-radius:8px;padding:14px 16px;text-align:left;font-family:monospace;font-size:.78rem;color:var(--text-secondary);line-height:1.9;">
+      <span style="color:var(--text-muted)"># Discord Developer Portal → deine App → OAuth2</span><br>
+      <span style="color:var(--accent)">DISCORD_CLIENT_ID</span>=<span style="color:var(--green)">deine_client_id</span><br>
+      <span style="color:var(--accent)">DISCORD_CLIENT_SECRET</span>=<span style="color:var(--green)">dein_client_secret</span><br>
+      <span style="color:var(--accent)">DISCORD_REDIRECT_URI</span>=<span style="color:var(--green)">http://localhost:5000/auth/callback</span><br>
+      <span style="color:var(--accent)">DASHBOARD_SECRET</span>=<span style="color:var(--green)">irgendein_langer_zufallsstring</span><br>
+      <span style="color:var(--accent)">ADMIN_USER_IDS</span>=<span style="color:var(--green)">deine_discord_user_id</span>
+    </div>
+
+    <div style="margin-top:18px;padding:12px;background:rgba(88,101,242,.08);border:1px solid rgba(88,101,242,.2);border-radius:8px;text-align:left;">
+      <div style="font-size:.78rem;font-weight:700;color:var(--accent);margin-bottom:6px;">So findest du deine Discord User ID:</div>
+      <div style="font-size:.75rem;color:var(--text-secondary);line-height:1.6;">
+        Discord → Einstellungen → Erweitert → Entwicklermodus aktivieren<br>
+        Dann: Rechtsklick auf deinen Namen → <strong>ID kopieren</strong>
+      </div>
+    </div>
+
+    <div style="margin-top:18px;padding:12px;background:rgba(59,165,92,.08);border:1px solid rgba(59,165,92,.2);border-radius:8px;text-align:left;">
+      <div style="font-size:.78rem;font-weight:700;color:var(--green);margin-bottom:6px;">OAuth2 App erstellen:</div>
+      <div style="font-size:.75rem;color:var(--text-secondary);line-height:1.6;">
+        1. <a href="https://discord.com/developers/applications" target="_blank" style="color:var(--accent);">discord.com/developers/applications</a> öffnen<br>
+        2. "New Application" → Name eingeben<br>
+        3. OAuth2 → Redirects → <code style="font-size:.72rem;background:var(--bg-hover);padding:1px 4px;border-radius:3px;">http://localhost:5000/auth/callback</code> hinzufügen<br>
+        4. Client ID + Secret kopieren und in .env eintragen
+      </div>
+    </div>
+
+    <p style="margin-top:20px;font-size:.72rem;color:var(--text-muted);">
+      Nach dem Neustart des Dashboards erscheint hier der Login-Button.
+    </p>
+  </div>
+</div>
+</body>
+</html>

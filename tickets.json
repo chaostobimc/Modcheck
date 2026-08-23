@@ -1,0 +1,14 @@
+{
+    "counter": 2,
+    "tickets": {
+        "1500472072588103764": {
+            "user_id": 829299014083936276,
+            "ticket_id": 2,
+            "status": "open",
+            "created_at": "2026-05-03T12:20:19.798524+00:00",
+            "claimed_by": null,
+            "betreff": "Bannt ByGorgii",
+            "beschreibung": "Bitte bannt ByGorgii"
+        }
+    }
+}

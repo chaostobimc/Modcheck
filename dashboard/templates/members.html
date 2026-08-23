@@ -1,0 +1,44 @@
+{% extends "base.html" %}
+{% block title %}Mitglieder{% endblock %}
+{% block page_title %}Mitglieder{% endblock %}
+{% block content %}
+
+<div class="card">
+  <div class="card-header">
+    <div class="card-header-icon" style="background:var(--green-glow)">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+    </div>
+    <span class="card-title">Servermitglieder</span>
+    <span class="card-badge badge-green">{{ members|length }}</span>
+  </div>
+  <div style="max-height:75vh;overflow-y:auto">
+    {% if members %}
+      {% for m in members %}
+        {% set user = m.user %}
+        {% set av = user.avatar %}
+        {% set disc = (user.discriminator|default('0')|int) % 5 %}
+        {% set av_url = 'https://cdn.discordapp.com/avatars/' + user.id + '/' + av + '.webp?size=64' if av else 'https://cdn.discordapp.com/embed/avatars/' + disc|string + '.png' %}
+        <div class="member-row">
+          <img class="member-av" src="{{ av_url }}" alt="">
+          <div>
+            <div class="member-name">{{ m.nick or user.username }}</div>
+            <div class="member-tag">{{ user.username }}</div>
+          </div>
+          {% if user.id|int in admin_ids %}
+            <span class="card-badge badge-blue" style="margin-left:8px">Admin</span>
+          {% endif %}
+          {% if m.joined_at %}
+            <div class="member-joined">Beigetreten {{ m.joined_at[:10] }}</div>
+          {% endif %}
+        </div>
+      {% endfor %}
+    {% else %}
+      <div class="empty-state" style="padding:48px">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+        <p>Keine Mitglieder geladen</p>
+      </div>
+    {% endif %}
+  </div>
+</div>
+
+{% endblock %}
