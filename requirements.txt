@@ -1,0 +1,48 @@
+# ============================================================
+#  Modcheck Discord + Twitch Bot
+#  requirements.txt – optimiert für Raspberry Pi 5 (aarch64)
+#  Python: 3.11+ (Raspberry Pi OS Bookworm liefert 3.11)
+#
+#  Installation:
+#    sudo apt update && sudo apt install -y python3 python3-venv python3-dev ffmpeg
+#    python3 -m venv venv
+#    source venv/bin/activate
+#    pip install --upgrade pip
+#    pip install -r requirements.txt
+# ============================================================
+
+# --- Discord Bot & Voice ---------------------------------
+discord.py[voice]>=2.4.0,<3.0      # inkl. PyNaCl + Audio-Unterstützung
+# PyNaCl wird von discord.py[voice] automatisch mitinstalliert
+pynacl>=1.5.0
+
+# --- Twitch Bot -------------------------------------------
+twitchio==2.10.0
+
+# --- Web / Dashboard (läuft im Bot-Prozess) --------------
+flask>=3.0.0,<4.0
+flask-sock>=0.7.0
+
+# --- Musik-Modul ------------------------------------------
+yt-dlp>=2025.6.9                    # WICHTIG: regelmäßig aktualisieren!
+                                    #   pip install -U yt-dlp
+                                    # (YouTube ändert ständig seine API)
+spotdl>=4.4.4                        # Spotify-URLs (Track-/Playlist-Auflösung)
+
+# --- AI (OpenRouter) --------------------------------------
+openai>=1.50.0
+
+# --- Text-zu-Sprache / Lyrics / Karaoke -------------------
+gTTS>=2.5.0
+syncedlyrics>=1.0.1
+
+# --- Karaoke-Video (optional, aber empfohlen) -------------
+pillow>=10.0.0
+numpy>=1.26.0
+av>=12.0.0                           # PyAV (H.264-Frame-Rendering)
+gradio_client>=1.0.0                 # Vocal-Remover (Hugging Face Space)
+
+# --- Allgemeine Abhängigkeiten ----------------------------
+python-dotenv>=1.0.0
+aiohttp>=3.9.0
+requests>=2.31.0

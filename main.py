@@ -1,4 +1,6 @@
 import os
+import sys
+import shutil
 import random
 import discord
 from discord.ext import commands, tasks
@@ -15,7 +17,6 @@ import io
 import tempfile
 import aiohttp
 from collections import deque
-from urllib.parse import urlparse
 from urllib.parse import urlparse, quote
 from functools import wraps
 
@@ -820,6 +821,13 @@ def save_tickets(data: dict) -> None:
         print(f"❌ Ticket Speicherfehler: {e}")
 
 
+def persist_tickets() -> None:
+    """Synchronisiert open_tickets (RAM) komplett mit tickets.json."""
+    data = load_tickets()
+    data["tickets"] = {str(k): dict(v) for k, v in open_tickets.items()}
+    save_tickets(data)
+
+
 def get_next_ticket_id() -> int:
     data = load_tickets()
     data["counter"] = data.get("counter", 0) + 1
@@ -881,9 +889,11 @@ class DiscordBot(commands.Bot):
         super().__init__(command_prefix="!", intents=intents)
 
     async def setup_hook(self):
-        # Persistente Views registrieren (Buttons nach Neustart)
+        # Persistente Views registrieren (Buttons überleben Neustarts)
+        # - Ticket-Panel-Button (Ticket erstellen)
         self.add_view(TicketOpenView())
-        # TicketControlView ohne channel_id registrieren (wird bei Bedarf instanziiert)
+        # - Fallback für Temp-Voice-Panel-Buttons ohne Message-Zuordnung
+        #   (die echten Views werden pro Kanal in on_ready neu registriert)
         self.add_view(VoiceChannelControlView(0, 0))
         if GUILD_ID:
             guild = discord.Object(id=GUILD_ID)
@@ -4330,23 +4340,40 @@ class TicketOpenView(discord.ui.View):
         button: discord.ui.Button,
     ):
         # Prüfen ob User bereits ein offenes Ticket hat
-        for ch_id, data in open_tickets.items():
-            if data["user_id"] == interaction.user.id and data["status"] == "open":
+        for ch_id, data in list(open_tickets.items()):
+            if data.get("user_id") == interaction.user.id and data.get("status") in ("open", "claimed"):
                 channel = interaction.guild.get_channel(ch_id)
                 if channel:
                     return await interaction.response.send_message(
                         f"❌ Du hast bereits ein offenes Ticket: {channel.mention}",
                         ephemeral=True,
                     )
+                # Kanal wurde extern gelöscht → veralteten Eintrag aufräumen
+                open_tickets.pop(ch_id, None)
+        persist_tickets()
         await interaction.response.send_modal(TicketCreateModal())
 
 
 class TicketControlView(discord.ui.View):
-    """View innerhalb des Ticket-Kanals."""
+    """View innerhalb des Ticket-Kanals.
 
-    def __init__(self, ticket_channel_id: int):
+    Robust gegen Bot-Neustarts: Der Ticket-Kanal wird aus der
+    INTERACTION heraus gelöst (interaction.channel_id), nicht aus
+    einem eventuell veralteten View-Zustand.
+    """
+
+    def __init__(self, ticket_channel_id: int, claimed_by_name: str = ""):
         super().__init__(timeout=None)
         self.ticket_channel_id = ticket_channel_id
+        # Claim-Button bei Neuanlage (z. B. nach Bot-Neustart) direkt
+        # im richtigen Zustand anzeigen.
+        if claimed_by_name:
+            self.btn_claim.label = f"✅ Geclaimed von {claimed_by_name[:30]}"
+            self.btn_claim.disabled = True
+
+    def _ticket_id_for(self, interaction: discord.Interaction) -> int:
+        """Löst die Ticket-Kanal-ID aus der Interaction (robust)."""
+        return interaction.channel_id or self.ticket_channel_id
 
     @discord.ui.button(
         label="✅ Claimen",
@@ -4359,7 +4386,8 @@ class TicketControlView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        ticket = open_tickets.get(self.ticket_channel_id)
+        channel_id = self._ticket_id_for(interaction)
+        ticket = open_tickets.get(channel_id)
         if not ticket:
             return await interaction.response.send_message(
                 "❌ Ticket nicht gefunden.", ephemeral=True
@@ -4389,7 +4417,10 @@ class TicketControlView(discord.ui.View):
             )
 
         ticket["claimed_by"] = interaction.user.id
+        ticket["claimed_by_name"] = interaction.user.display_name
         ticket["status"] = "claimed"
+        ticket["ticket_message_id"] = interaction.message.id if interaction.message else None
+        persist_tickets()
 
         embed = discord.Embed(
             title="✅ Ticket geclaimed",
@@ -4401,21 +4432,27 @@ class TicketControlView(discord.ui.View):
         )
         await interaction.response.send_message(embed=embed)
 
-        # Button aktualisieren
-        button.label = f"✅ Geclaimed von {interaction.user.display_name}"
+        # Button im ORIGINALEN Ticket-Embed aktualisieren
+        # (nicht in der Claim-Ankündigung!)
+        button.label = f"✅ Geclaimed von {interaction.user.display_name[:30]}"
         button.disabled = True
         try:
-            await interaction.edit_original_response(view=self)
-        except Exception:
-            pass
+            msg = interaction.message
+            if msg is not None:
+                await msg.edit(view=self)
+        except Exception as e:
+            print(f"⚠️ [Ticket] Button-Update fehlgeschlagen: {e}")
 
-        # Log senden
-        await send_ticket_log(
-            interaction.guild,
-            "claim",
-            ticket,
-            interaction.user,
-        )
+        # Log senden (darf das Ticket nicht blockieren)
+        try:
+            await send_ticket_log(
+                interaction.guild,
+                "claim",
+                ticket,
+                interaction.user,
+            )
+        except Exception as e:
+            print(f"⚠️ [Ticket] Claim-Log Fehler: {e}")
 
     @discord.ui.button(
         label="🔒 Schließen",
@@ -4428,7 +4465,8 @@ class TicketControlView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
-        ticket = open_tickets.get(self.ticket_channel_id)
+        channel_id = self._ticket_id_for(interaction)
+        ticket = open_tickets.get(channel_id)
         if not ticket:
             return await interaction.response.send_message(
                 "❌ Ticket nicht gefunden.", ephemeral=True
@@ -4442,7 +4480,7 @@ class TicketControlView(discord.ui.View):
             if support_role
             else interaction.user.guild_permissions.manage_channels
         )
-        is_ticket_owner = interaction.user.id == ticket["user_id"]
+        is_ticket_owner = interaction.user.id == ticket.get("user_id")
 
         if not is_support and not is_ticket_owner:
             return await interaction.response.send_message(
@@ -4455,7 +4493,7 @@ class TicketControlView(discord.ui.View):
         )
         await close_ticket(
             interaction.guild,
-            self.ticket_channel_id,
+            channel_id,
             interaction.user,
         )
 
@@ -4470,6 +4508,7 @@ class TicketControlView(discord.ui.View):
         interaction: discord.Interaction,
         button: discord.ui.Button,
     ):
+        channel_id = self._ticket_id_for(interaction)
         support_role = discord.utils.get(
             interaction.guild.roles, name=TICKET_SUPPORT_ROLE
         )
@@ -4486,15 +4525,17 @@ class TicketControlView(discord.ui.View):
             )
 
         await interaction.response.defer(ephemeral=True)
-        transcript = await generate_transcript(
-            interaction.guild, self.ticket_channel_id
-        )
+        try:
+            transcript = await generate_transcript(interaction.guild, channel_id)
+        except Exception as e:
+            print(f"⚠️ [Ticket] Transcript-Fehler: {e}")
+            transcript = None
         if transcript:
             await interaction.followup.send(
                 "📄 **Ticket-Transcript:**",
                 file=discord.File(
                     fp=transcript,
-                    filename=f"transcript-{self.ticket_channel_id}.txt",
+                    filename=f"transcript-{channel_id}.txt",
                 ),
                 ephemeral=True,
             )
@@ -4503,6 +4544,64 @@ class TicketControlView(discord.ui.View):
                 "❌ Transcript konnte nicht erstellt werden.",
                 ephemeral=True,
             )
+
+
+# Registrierte Ticket-Views (pro Ticket-Kanal) – werden beim Schließen
+# wieder entfernt, damit keine alten Views im Speicher bleiben.
+ticket_views: dict[int, TicketControlView] = {}
+
+
+def remove_bot_view(view) -> None:
+    """Entfernt einen View aus dem Bot (discord.py-Version-unabhängig)."""
+    try:
+        if hasattr(d_bot, "remove_view"):
+            d_bot.remove_view(view)
+            return
+        # discord.py < 2.8 hat kein Client.remove_view → direkt
+        # über den ViewStore
+        d_bot._connection._view_store.remove_view(view)
+    except Exception as e:
+        print(f"⚠️ [Bot] View-Entfernung fehlgeschlagen: {e}")
+
+
+def register_ticket_view(
+    channel_id: int,
+    message_id: int = None,
+    claimed_by_name: str = "",
+) -> TicketControlView:
+    """Registriert die Control-View für ein Ticket (persistierend).
+
+    Wichtig: Bei `message_id` wird der View exakt der Ticket-Message
+    zugeordnet (discord.py dispatcht pro Message), sonst als globaler
+    Fallback. Der Callback löst den Kanal ohnehin aus der Interaction.
+    """
+    view = TicketControlView(channel_id, claimed_by_name)
+    ticket_views[channel_id] = view
+    try:
+        if message_id:
+            d_bot.add_view(view, message_id=int(message_id))
+        else:
+            d_bot.add_view(view)
+    except Exception as e:
+        print(f"⚠️ [Tickets] View-Registrierung fehlgeschlagen: {e}")
+    return view
+
+
+async def find_ticket_message_id(guild: discord.Guild, channel_id: int) -> int:
+    """Sucht die Ticket-Message (mit Claim-Button) in einem Kanal."""
+    try:
+        channel = guild.get_channel(channel_id)
+        if not channel:
+            return 0
+        async for m in channel.history(limit=30):
+            comps = getattr(m, "components", [])
+            for row in comps:
+                for b in getattr(row, "children", []):
+                    if getattr(b, "custom_id", None) == "ticket_claim_btn":
+                        return m.id
+    except Exception:
+        pass
+    return 0
 
 
 async def create_ticket(
@@ -4588,14 +4687,13 @@ async def create_ticket(
         "status": "open",
         "created_at": now_str,
         "claimed_by": None,
+        "claimed_by_name": "",
         "betreff": betreff,
         "beschreibung": beschreibung,
     }
 
     # Ticket in JSON speichern
-    ticket_data = load_tickets()
-    ticket_data["tickets"][str(channel.id)] = open_tickets[channel.id]
-    save_tickets(ticket_data)
+    persist_tickets()
 
     # Ticket-Embed senden
     embed = discord.Embed(
@@ -4619,7 +4717,15 @@ async def create_ticket(
     if support_role:
         mention_text += f" | {support_role.mention}"
 
-    await channel.send(content=mention_text, embed=embed, view=view)
+    ticket_msg = await channel.send(content=mention_text, embed=embed, view=view)
+
+    # Persistierend registrieren – exakt an die Ticket-Message gebunden,
+    # damit die Buttons auch nach einem Bot-Neustart funktionieren
+    register_ticket_view(channel.id, message_id=ticket_msg.id)
+
+    # Message-ID merken (wird beim Neustart zur Re-Registrierung genutzt)
+    open_tickets[channel.id]["ticket_message_id"] = ticket_msg.id
+    persist_tickets()
 
     # Bestätigung an den User
     await interaction.followup.send(
@@ -4638,7 +4744,12 @@ async def close_ticket(
     channel_id: int,
     closed_by: discord.Member,
 ) -> None:
-    """Schließt und löscht einen Ticket-Kanal."""
+    """Schließt und löscht einen Ticket-Kanal.
+
+    Jede Teilaufgabe (Transcript, Log, DM) ist gefangen, damit der
+    Kanal IMMER zuverlässig gelöscht wird – auch wenn ein Log-Kanal
+    fehlt oder der User keine DMs empfängt.
+    """
     ticket = open_tickets.get(channel_id)
     if not ticket:
         return
@@ -4646,47 +4757,69 @@ async def close_ticket(
     channel = guild.get_channel(channel_id)
     if not channel:
         open_tickets.pop(channel_id, None)
+        persist_tickets()
         return
 
     ticket["status"] = "closed"
-
-    # Transcript generieren vor dem Löschen
-    transcript = await generate_transcript(guild, channel_id)
-
-    # Log senden
-    await send_ticket_log(guild, "close", ticket, closed_by, transcript)
-
-    # DM an Ticket-Ersteller
     try:
-        ticket_user = guild.get_member(ticket["user_id"])
+        ticket_num = int(ticket.get("ticket_id") or 0)
+    except (TypeError, ValueError):
+        ticket_num = 0
+
+    # Transcript generieren vor dem Löschen (optional)
+    transcript = None
+    try:
+        transcript = await generate_transcript(guild, channel_id)
+    except Exception as e:
+        print(f"⚠️ [Ticket] Transcript-Fehler: {e}")
+
+    # Log senden (optional – darf das Schließen nicht blockieren)
+    try:
+        await send_ticket_log(guild, "close", ticket, closed_by, transcript)
+    except Exception as e:
+        print(f"⚠️ [Ticket] Close-Log Fehler: {e}")
+
+    # DM an Ticket-Ersteller (optional)
+    try:
+        ticket_user = guild.get_member(ticket.get("user_id") or 0)
         if ticket_user:
+            created_str = ticket.get("created_at", "")
+            created_ts = 0
+            try:
+                created_ts = int(
+                    datetime.datetime.fromisoformat(created_str).timestamp()
+                )
+            except Exception:
+                pass
+            desc = f"Dein Ticket wurde von {closed_by.mention} geschlossen.\n\n"
+            desc += f"**Betreff:** {ticket.get('betreff', '')}\n"
+            if created_ts:
+                desc += f"**Erstellt:** <t:{created_ts}:R>"
             close_embed = discord.Embed(
-                title=f"🔒 Ticket #{ticket['ticket_id']:04d} geschlossen",
-                description=(
-                    f"Dein Ticket wurde von {closed_by.mention} geschlossen.\n\n"
-                    f"**Betreff:** {ticket['betreff']}\n"
-                    f"**Erstellt:** <t:{int(datetime.datetime.fromisoformat(ticket['created_at']).timestamp())}:R>"
-                ),
+                title=f"🔒 Ticket #{ticket_num:04d} geschlossen",
+                description=desc,
                 color=COLOR_ERROR,
                 timestamp=datetime.datetime.now(datetime.timezone.utc),
             )
             await ticket_user.send(embed=close_embed)
     except Exception:
-        pass
+        pass  # DMs blockiert → nicht weiter schlimm
 
-    # Aus RAM entfernen
+    # Aus RAM + JSON entfernen
     open_tickets.pop(channel_id, None)
+    persist_tickets()
 
-    # Aus JSON entfernen
-    ticket_data = load_tickets()
-    ticket_data["tickets"].pop(str(channel_id), None)
-    save_tickets(ticket_data)
+    # Registrierte View entfernen (damit sie nach dem Neustart
+    # nicht erneut für einen gelöschten Kanal geladen wird)
+    view = ticket_views.pop(channel_id, None)
+    if view is not None:
+        remove_bot_view(view)
 
     # Kanal schließen
     await asyncio.sleep(3)
     try:
         await channel.delete(reason=f"Ticket geschlossen von {closed_by.display_name}")
-        print(f"🔒 [Ticket] #{ticket['ticket_id']:04d} geschlossen von {closed_by.display_name}")
+        print(f"🔒 [Ticket] #{ticket_num:04d} geschlossen von {closed_by.display_name}")
     except Exception as e:
         print(f"❌ [Ticket] Fehler beim Löschen: {e}")
 
@@ -4702,10 +4835,14 @@ async def generate_transcript(
         return None
 
     ticket = open_tickets.get(channel_id, {})
+    try:
+        _tid = int(ticket.get("ticket_id") or 0)
+    except (TypeError, ValueError):
+        _tid = 0
     lines = [
         f"═══════════════════════════════════════════",
         f"  TICKET TRANSCRIPT",
-        f"  Ticket #: {ticket.get('ticket_id', '?'):04d}",
+        f"  Ticket #: {_tid:04d}",
         f"  Betreff: {ticket.get('betreff', '?')}",
         f"  Erstellt von: {ticket.get('user_id', '?')}",
         f"  Datum: {datetime.datetime.now(datetime.timezone.utc).strftime('%d.%m.%Y %H:%M UTC')}",
@@ -4736,11 +4873,33 @@ async def send_ticket_log(
     actor: discord.Member,
     transcript=None,
 ) -> None:
-    """Sendet ein Log-Embed in den Ticket-Log-Kanal."""
+    """Sendet ein Log-Embed in den Ticket-Log-Kanal.
+
+    Nie eine Exception nach außen werfen – ein fehlender Log-Kanal
+    darf kein Ticket-Feature kaputt machen.
+    """
+    try:
+        return await _send_ticket_log_inner(guild, action, ticket, actor, transcript)
+    except Exception as e:
+        print(f"⚠️ [Ticket] Log-Fehler: {type(e).__name__}: {e}")
+
+
+async def _send_ticket_log_inner(
+    guild: discord.Guild,
+    action: str,
+    ticket: dict,
+    actor: discord.Member,
+    transcript=None,
+) -> None:
     log_channel_id = TICKET_LOG_CHANNEL_ID or LOG_CHANNEL_ID
     log_channel = guild.get_channel(log_channel_id)
     if not log_channel:
         return
+
+    try:
+        _tid = int(ticket.get("ticket_id") or 0)
+    except (TypeError, ValueError):
+        _tid = 0
 
     action_configs = {
         "open": {
@@ -4767,7 +4926,7 @@ async def send_ticket_log(
     )
     embed.add_field(
         name="🆔 Ticket",
-        value=f"`#{ticket.get('ticket_id', '?'):04d}`",
+        value=f"`#{_tid:04d}`",
         inline=True,
     )
     embed.add_field(
@@ -4802,7 +4961,7 @@ async def send_ticket_log(
             embed=embed,
             file=discord.File(
                 fp=transcript,
-                filename=f"transcript-ticket-{ticket.get('ticket_id', 0):04d}.txt",
+                filename=f"transcript-ticket-{_tid:04d}.txt",
             ),
         )
     else:
@@ -5330,18 +5489,19 @@ async def play_russian_roulette(
                 eliminated.append(player)
                 player_index = player_index % max(1, len(alive))
 
+                bang_line = random.choice([
+                    'Das war leider die falsche Kammer...',
+                    'Pech gehabt...',
+                    'Die Kugel hat ihr Ziel gefunden...',
+                    'Das Glück war nicht auf deiner Seite...',
+                    'F in den Chat...',
+                ])
                 await channel.send(
                     embed=discord.Embed(
                         title="💥 BANG!",
                         description=(
                             f"**{player.mention}** wurde getroffen! 💀\n\n"
-                            f"*{random.choice([
-                                'Das war leider die falsche Kammer...',
-                                'Pech gehabt...',
-                                'Die Kugel hat ihr Ziel gefunden...',
-                                'Das Glück war nicht auf deiner Seite...',
-                                'F in den Chat...',
-                            ])}*"
+                            f"*{bang_line}*"
                         ),
                         color=COLOR_ERROR,
                     )
@@ -5363,17 +5523,18 @@ async def play_russian_roulette(
                     await channel.send("🔄 *Neue Trommel wird geladen...*")
                     await asyncio.sleep(1.5)
             else:
+                survive_line = random.choice([
+                    'Die Kammer war leer!',
+                    'Noch einmal davon gekommen...',
+                    'Das Glück ist auf deiner Seite!',
+                    'Phew... Das war knapp!',
+                ])
                 await channel.send(
                     embed=discord.Embed(
                         title="😮‍💨 *klick* – Überlebt!",
                         description=(
                             f"**{player.mention}** hat Glück!\n"
-                            f"*{random.choice([
-                                'Die Kammer war leer!',
-                                'Noch einmal davon gekommen...',
-                                'Das Glück ist auf deiner Seite!',
-                                'Phew... Das war knapp!',
-                            ])}*"
+                            f"*{survive_line}*"
                         ),
                         color=COLOR_SUCCESS,
                     )
@@ -5629,7 +5790,7 @@ class SongSelectModal(discord.ui.Modal, title="🎵 Song auswählen"):
             "title": entry.get("title", "Unbekannt"),
             "webpage_url": _get_reference_url(entry, query),
             "duration": int(entry.get("duration", 0)) if entry.get("duration") else 0,
-            "thumbnail": entry.get("thumbnail", ""),
+            "thumbnail": _entry_thumbnail(entry),
         }
 
         if self.player.id == self.battle_data["challenger_id"]:
@@ -7999,8 +8160,8 @@ async def process_ai_reply(message: discord.Message, user_input: str):
         return
     if not message or not message.channel:
         return
-    async with message.channel.typing():
-        try:
+    try:
+        async with message.channel.typing():
             response = await key_rotator.call_with_rotation(
                 lambda c: c.chat.completions.create(
                     model=AI_MODEL_NAME,
@@ -8008,14 +8169,22 @@ async def process_ai_reply(message: discord.Message, user_input: str):
                     extra_headers={"X-Title": "Discord AI Bot"},
                 )
             )
-            ai_message = response.choices[0].message.content
-            max_length = 2000 - len(AI_FOOTER)
-            if ai_message and len(ai_message) > max_length:
-                ai_message = ai_message[:max_length - 3] + "..."
-            await message.reply(f"{ai_message}{AI_FOOTER}")
-        except Exception as e:
-            print(f"KI-Antwort Fehler: {e}")
-            await message.reply("Ein interner Fehler ist aufgetreten.")
+        ai_message = response.choices[0].message.content
+        max_length = 2000 - len(AI_FOOTER)
+        if ai_message and len(ai_message) > max_length:
+            ai_message = ai_message[:max_length - 3] + "..."
+        await message.reply(f"{ai_message}{AI_FOOTER}")
+    except Exception as e:
+        # KEINE Fehlermeldung mehr öffentlich in den Chat –
+        # nur Logging + optional eine stille DM an den User.
+        print(f"KI-Antwort Fehler: {e}")
+        try:
+            await message.author.send(
+                "⚠️ Ich konnte gerade keine KI-Antwort erstellen "
+                "(API-Fehler). Bitte probiere es später noch einmal."
+            )
+        except Exception:
+            pass  # DMs blockiert → still bleiben
 
 
 # ══════════════════════════════════════════════════════════
@@ -9634,9 +9803,20 @@ if MUSIC_ENABLED:
         MUSIC_ENABLED = False
         YDL = None
 
+FFMPEG_AVAILABLE = True  # wird in check_system_requirements() geprüft
+
 FFMPEG_OPTIONS = {
     'before_options': '-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
     'options': '-vn',
+}
+
+# Netzwerk-Timeouts für yt-dlp – verhindert, dass der Bot auf dem Pi
+# ewig hängt wenn ein Stream nicht erreichbar ist (statt "hängt"
+# wird der Song übersprungen und der nächste versucht).
+YDL_TIMEOUTS = {
+    'socket_timeout': 20,
+    'request_timeout': 20,
+    'extractor_retries': 2,
 }
 
 YTDL_FORMAT_OPTIONS = {
@@ -9652,6 +9832,7 @@ YTDL_FORMAT_OPTIONS = {
     'extract_flat': False,
     'cachedir': False,
     'no_cache_dir': True,
+    **YDL_TIMEOUTS,
 }
 
 YTDL_SEARCH_OPTIONS = {
@@ -9665,6 +9846,7 @@ YTDL_SEARCH_OPTIONS = {
     'source_address': '0.0.0.0', # Erzwingt IPv4
     'extract_flat': True,        # 👈 Ändern auf True für High-Speed Suche
     'cachedir': False,
+    **YDL_TIMEOUTS,
 }
 
 YTDL_PLAYLIST_OPTIONS = {
@@ -9708,6 +9890,10 @@ class GuildMusicState:
         self.history: deque[str] = deque(maxlen=10)
         self._idle_seconds: int = 0
         self._lock = asyncio.Lock()
+        # Counting consecutive playback failures – prevents an
+        # endless "Konnte nicht abspielen" message loop
+        # (e.g., when YouTube is temporarily unreachable)
+        self.consecutive_failures: int = 0
 
     async def cleanup(self):
         self.queue.clear()
@@ -9739,6 +9925,10 @@ class GuildMusicState:
     def is_idle_timeout(self) -> bool:
         return self._idle_seconds >= MUSIC_IDLE_TIMEOUT
 
+    def note_failure(self) -> int:
+        self.consecutive_failures += 1
+        return self.consecutive_failures
+
 
 music_states: dict[int, GuildMusicState] = {}
 
@@ -9752,10 +9942,12 @@ def get_music_state(guild_id: int, bot) -> GuildMusicState:
 async def ytdl_extract(query: str, options: dict) -> dict | None:
     if not MUSIC_ENABLED:
         return None
-    loop = asyncio.get_event_loop()
+    # Netzwerk-Timeouts immer mitgeben (Aufrufer können überschreiben)
+    opts = {**YDL_TIMEOUTS, **options}
+    loop = asyncio.get_running_loop()
     try:
         def _extract():
-            with yt_dlp.YoutubeDL(options) as ydl:
+            with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(query, download=False)
         return await loop.run_in_executor(None, _extract)
     except Exception as e:
@@ -9763,14 +9955,19 @@ async def ytdl_extract(query: str, options: dict) -> dict | None:
         return None
 
 
-async def resolve_song_url(song: SongInfo) -> str | None:
-    """
-    Schnelle Stream-URL Auflösung.
-    Holt nur die Audio-URL und repariert bei Bedarf die Referenz-URL.
-    """
-    if not song.webpage_url:
-        return None
+# Fallback-Ketten für YouTube: Wenn der Standard-Client von YouTube
+# blockiert wird ("Sign in to confirm you're not a bot", abgelaufene
+# Player-URLs), probieren wir andere Player-Clients – das macht die
+# Musik-Playback deutlich robuster, v. a. auf dem Raspberry Pi.
+YDL_PLAYER_CLIENT_FALLBACKS = [
+    None,  # Standard
+    {'extractor_args': {'youtube': {'player_client': ['android', 'web']}}},
+    {'extractor_args': {'youtube': {'player_client': ['tv', 'web_safari']}}},
+]
 
+
+def _ydl_resolve_once(webpage_url: str, extra_opts: dict | None = None) -> dict | None:
+    """Einmaliger yt-dlp-Resolve (läuft im Executor, nie im Event-Loop)."""
     ydl_opts = {
         'format': 'bestaudio/best',
         'quiet': True,
@@ -9778,28 +9975,53 @@ async def resolve_song_url(song: SongInfo) -> str | None:
         'noplaylist': True,
         'source_address': '0.0.0.0',
         'extract_flat': False,
+        'nocheckcertificate': True,
+        **YDL_TIMEOUTS,
     }
+    if extra_opts:
+        ydl_opts.update(extra_opts)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        return ydl.extract_info(webpage_url, download=False)
 
-    try:
-        loop = asyncio.get_event_loop()
 
-        def extract():
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                return ydl.extract_info(song.webpage_url, download=False)
+async def resolve_song_url(song: SongInfo) -> str | None:
+    """
+    Stream-URL Auflösung mit Fallback-Kette.
+    Holt die Audio-URL und repariert bei Bedarf die Referenz-URL.
+    Gibt None zurück wenn alles fehlschlägt (Song wird übersprungen).
+    """
+    if not song.webpage_url:
+        return None
 
-        info = await loop.run_in_executor(None, extract)
+    loop = asyncio.get_running_loop()
+
+    for i, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
+        try:
+            info = await loop.run_in_executor(
+                None, _ydl_resolve_once, song.webpage_url, extra_opts
+            )
+        except Exception as e:
+            print(f"⚠️ [Music] Resolve Versuch {i + 1} fehlgeschlagen: "
+                  f"{type(e).__name__}: {e}")
+            continue
 
         if info:
             ref_url = _get_reference_url(info, song.webpage_url)
             if ref_url:
                 song.webpage_url = ref_url
 
-            if 'url' in info:
+            if 'url' in info and info['url']:
                 return info['url']
+            # Playlist/Andere – ersten Eintrag verwenden
+            if 'entries' in info and info['entries']:
+                first = info['entries'][0]
+                if first and 'url' in first:
+                    ref = _get_reference_url(first, song.webpage_url)
+                    if ref:
+                        song.webpage_url = ref
+                    return first['url']
 
-    except Exception as e:
-        print(f"❌ [Music] Schnell-Resolve Fehler: {e}")
-
+    print(f"❌ [Music] Alle Resolve-Versuche fehlgeschlagen: {song.title}")
     return None
 
 async def search_tracks(query: str, limit: int = 1) -> list[dict]:
@@ -10034,6 +10256,25 @@ def _get_reference_url(entry: dict, fallback_url: str = "") -> str:
 
     return ""
 
+def _entry_thumbnail(entry: dict) -> str:
+    """Liest das Thumbnail eines yt-dlp-Entries.
+
+    `extract_flat`-Suche liefert `thumbnails` (Liste),
+    eine Voll-Extraktion liefert `thumbnail` (String).
+    """
+    if not entry:
+        return ""
+    thumb = entry.get("thumbnail")
+    if isinstance(thumb, str) and thumb:
+        return thumb
+    thumbs = entry.get("thumbnails") or []
+    for t in thumbs:
+        url = t.get("url") if isinstance(t, dict) else None
+        if url:
+            return url
+    return ""
+
+
 def _is_url(query: str) -> bool:
     return query.startswith(('http://', 'https://', 'www.'))
 
@@ -10044,6 +10285,25 @@ def _is_playlist_url(query: str) -> bool:
 
 async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = None):
     if not state.voice_client or not state.voice_client.is_connected():
+        return
+
+    # FFmpeg fehlt → Playback ist unmöglich (häufigster Grund für
+    # "Musik funktioniert nicht" auf dem Raspberry Pi)
+    if not FFMPEG_AVAILABLE:
+        if text_channel:
+            try:
+                await text_channel.send(
+                    "❌ **Musik-Playback ist nicht möglich:** FFmpeg ist nicht "
+                    "installiert!\n"
+                    "-# Raspberry Pi: `sudo apt update && sudo apt install -y ffmpeg` "
+                    "→ danach den Bot neu starten.",
+                    delete_after=60,
+                )
+            except Exception:
+                pass
+        print("❌ [Music] FFmpeg fehlt – kann nicht abspielen "
+              "(sudo apt install ffmpeg)")
+        state.queue.clear()
         return
 
     # Queue leer → Autoplay versuchen
@@ -10091,7 +10351,10 @@ async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = 
     # Stream-URL auflösen
     stream_url = await resolve_song_url(song)
     if not stream_url:
-        if text_channel:
+        state.current = None  # wieder "idle"-fähig machen
+        failures = state.note_failure()
+        if text_channel and failures <= 3:
+            # nach 3 Fehlern keine Spam-Loop mehr, nur Logging
             try:
                 await text_channel.send(
                     f"❌ Konnte **{song.title}** nicht abspielen. Überspringe...",
@@ -10099,15 +10362,21 @@ async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = 
                 )
             except Exception:
                 pass
-        # Nächsten Song versuchen (ohne Rekursion im Lock)
-        asyncio.create_task(play_next(state, text_channel))
+        elif failures == 4:
+            print(f"⚠️ [Music] {failures - 1} Songs in Folge fehlgeschlagen – "
+                  f"weitere Fehler-Meldungen im Chat werden unterdrückt")
+        if state.queue:
+            # Nächsten Song versuchen (ohne Rekursion im Lock)
+            asyncio.create_task(play_next(state, text_channel))
         return
 
     try:
         source = discord.FFmpegOpusAudio(stream_url, **FFMPEG_OPTIONS)
     except Exception as e:
         print(f"❌ [Music] FFmpeg Fehler: {e}")
-        if text_channel:
+        state.current = None
+        failures = state.note_failure()
+        if text_channel and failures <= 3:
             try:
                 await text_channel.send(
                     f"❌ FFmpeg-Fehler bei **{song.title}**. Überspringe...",
@@ -10115,7 +10384,8 @@ async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = 
                 )
             except Exception:
                 pass
-        asyncio.create_task(play_next(state, text_channel))
+        if state.queue:
+            asyncio.create_task(play_next(state, text_channel))
         return
 
     # History tracken – MUSS eine youtube.com/watch URL sein
@@ -10141,6 +10411,7 @@ async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = 
 
     try:
         state.voice_client.play(source, after=after_playing)
+        state.consecutive_failures = 0
         print(f"🎶 [Music] Spielt jetzt: {song.title}")
         # Dashboard: Now Playing
         try:
@@ -10190,7 +10461,9 @@ async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = 
         if song.webpage_url and song.webpage_url.startswith("http"):
             class SongLinkView(discord.ui.View):
                 def __init__(self, url: str):
-                    super().__init__(timeout=None)
+                    # Timeout statt persistierend – sonst sammelt sich
+                    # für jeden gespielten Song eine View im Speicher an
+                    super().__init__(timeout=1800)
                     self.add_item(discord.ui.Button(
                         label="▶️ Auf YouTube öffnen",
                         url=url,
@@ -10344,7 +10617,7 @@ class SearchResultSelectView(discord.ui.View):
         title = entry.get('title', 'Unbekannt')
         webpage_url = _get_reference_url(entry)
         duration = int(entry.get('duration', 0)) if entry.get('duration') else 0
-        thumbnail = entry.get('thumbnail', '')
+        thumbnail = _entry_thumbnail(entry)
         song = SongInfo(title, '', webpage_url, duration, thumbnail, self.requester)
         state = get_music_state(self.guild_id, d_bot)
 
@@ -11081,8 +11354,13 @@ async def music_idle_checker():
             to_cleanup.append(guild_id)
             continue
 
-        # Idle-Timer (nur wenn nichts spielt)
-        if not state.voice_client.is_playing() and not state.voice_client.is_paused():
+        # Idle-Timer: Nur zählen wenn WIRKLICH nichts läuft –
+        # weder spielt noch wartet noch wird gerade ein Song
+        # aufgelöst (dauert auf dem Raspberry Pi manchmal lange)
+        if (not state.voice_client.is_playing()
+                and not state.voice_client.is_paused()
+                and state.current is None
+                and not state.queue):
             state.increment_idle()
             if state.is_idle_timeout:
                 print(f"🎵 [Music] Idle-Timeout in Guild {guild_id} ({MUSIC_IDLE_TIMEOUT}s) – verlasse Kanal")
@@ -11222,6 +11500,17 @@ async def on_ready():
                         "locked": False,
                         "limit": vc.user_limit,
                     }
+                    # Control-View neu registrieren, damit die Panel-Buttons
+                    # (Umbenennen/Limit/Bitrate/...) nach Neustart wieder gehen.
+                    # Mit Message-ID, damit jeder VC seine eigene View hat!
+                    try:
+                        vc_view = VoiceChannelControlView(owner.id, vc.id)
+                        d_bot.add_view(
+                            vc_view,
+                            message_id=control_message_id or None,
+                        )
+                    except Exception as e:
+                        print(f"⚠️ [TempVC] View-Registrierung fehlgeschlagen: {e}")
                     print(f"♻️ [TempVC] Kanal wiederhergestellt nach Neustart: {vc.name} (Owner: {owner.display_name})")
 
         # Auch Text-Kanäle ohne zugehörigen VC aufräumen
@@ -11247,16 +11536,48 @@ async def on_ready():
 
     # Tickets nach Neustart wiederherstellen
     ticket_data = load_tickets()
+    restored_tickets = 0
     for ch_id_str, ticket in ticket_data.get("tickets", {}).items():
-        ch_id = int(ch_id_str)
+        try:
+            ch_id = int(ch_id_str)
+        except (TypeError, ValueError):
+            continue
         if ticket.get("status") in ("open", "claimed"):
             for guild in d_bot.guilds:
                 channel = guild.get_channel(ch_id)
                 if channel:
                     open_tickets[ch_id] = ticket
+                    # WICHTIG: View neu registrieren, sonst funktionieren
+                    # die Buttons (Claim/Schließen/Transcript) nach dem
+                    # Neustart nicht!
+                    msg_id = int(ticket.get("ticket_message_id") or 0)
+                    if not msg_id:
+                        # Alte Tickets ohne gespeicherte Message-ID →
+                        # Ticket-Message (mit Claim-Button) im Kanal suchen
+                        msg_id = await find_ticket_message_id(guild, ch_id)
+                    register_ticket_view(
+                        ch_id,
+                        message_id=msg_id or None,
+                        claimed_by_name=ticket.get("claimed_by_name", "") or "",
+                    )
+                    restored_tickets += 1
                     break
-    if open_tickets:
-        print(f"✅ [Tickets] {len(open_tickets)} Tickets nach Neustart wiederhergestellt")
+    # Verwaiste Ticket-Einträge (Kanal nicht mehr da) aus dem JSON streichen
+    if ticket_data.get("tickets"):
+        stale = []
+        for k in ticket_data["tickets"]:
+            try:
+                if int(k) not in open_tickets:
+                    stale.append(k)
+            except (TypeError, ValueError):
+                stale.append(k)
+        if stale:
+            for k in stale:
+                ticket_data["tickets"].pop(k, None)
+            save_tickets(ticket_data)
+            print(f"🧹 [Tickets] {len(stale)} verwaiste Ticket-Einträge aufgeräumt")
+    if restored_tickets:
+        print(f"✅ [Tickets] {restored_tickets} Tickets nach Neustart wiederhergestellt")
 
     # Weekly Scheduler starten
     if REVIEW_CHANNEL_ID and not review_scheduler.is_running():
@@ -11668,7 +11989,11 @@ async def on_message(message: discord.Message):
         if not user_input:
             await message.reply("Wie kann ich dir helfen?")
         else:
-            await process_ai_reply(message, user_input)
+            try:
+                await process_ai_reply(message, user_input)
+            except Exception as e:
+                # Fehler nie öffentlich senden, nur loggen
+                print(f"❌ [AI] on_message Fehler: {type(e).__name__}: {e}")
     # Dashboard: Nachricht zählen
     try:
         if not message.author.bot and message.guild:
@@ -12561,7 +12886,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
             title = entry.get('title', 'Unbekannt')
             webpage_url = _get_reference_url(entry)
             duration = int(entry.get('duration', 0)) if entry.get('duration') else 0
-            thumbnail = entry.get('thumbnail', '')
+            thumbnail = _entry_thumbnail(entry)
             if not webpage_url:
                 continue
             song = SongInfo(title, '', webpage_url, duration, thumbnail, interaction.user)
@@ -12587,7 +12912,7 @@ async def cmd_play(interaction: discord.Interaction, query: str):
     title = entry.get('title', 'Unbekannt')
     webpage_url = _get_reference_url(entry, query)
     duration = int(entry.get('duration', 0)) if entry.get('duration') else 0
-    thumbnail = entry.get('thumbnail', '')
+    thumbnail = _entry_thumbnail(entry)
 
     song = SongInfo(title, '', webpage_url, duration, thumbnail, interaction.user)
     state.queue.append(song)
@@ -13167,21 +13492,24 @@ async def cmd_tickets(interaction: discord.Interaction):
 
     lines = []
     for ch_id, ticket in open_tickets.items():
-        channel = interaction.guild.get_channel(ch_id)
-        ch_mention = channel.mention if channel else f"`{ch_id}`"
-        user = interaction.guild.get_member(ticket["user_id"])
-        user_str = user.mention if user else f"`{ticket['user_id']}`"
-        claimed = ""
-        if ticket.get("claimed_by"):
-            claimer = interaction.guild.get_member(ticket["claimed_by"])
-            claimed = f" • ✅ {claimer.display_name if claimer else '?'}"
-        created_ts = int(
-            datetime.datetime.fromisoformat(ticket["created_at"]).timestamp()
-        )
+        try:
+            channel = interaction.guild.get_channel(ch_id)
+            ch_mention = channel.mention if channel else f"`{ch_id}`"
+            user = interaction.guild.get_member(ticket.get("user_id") or 0)
+            user_str = user.mention if user else f"`{ticket.get('user_id', '?')}`"
+            claimed = ""
+            if ticket.get("claimed_by"):
+                claimer = interaction.guild.get_member(ticket["claimed_by"])
+                claimed = f" • ✅ {claimer.display_name if claimer else '?'}"
+            created_ts = int(
+                datetime.datetime.fromisoformat(ticket["created_at"]).timestamp()
+            )
+        except Exception:
+            continue  # kaputter Eintrag → überspringen statt Crashe
         lines.append(
-            f"🎫 **#{ticket['ticket_id']:04d}** {ch_mention}\n"
+            f"🎫 **#{int(ticket.get('ticket_id') or 0):04d}** {ch_mention}\n"
             f"╰ {user_str} • <t:{created_ts}:R>{claimed}\n"
-            f"╰ *{ticket['betreff']}*"
+            f"╰ *{ticket.get('betreff', '?')}*"
         )
 
     embed = discord.Embed(
@@ -15279,29 +15607,49 @@ async def cmd_karaoke_stop(interaction: discord.Interaction) -> None:
     await interaction.response.send_message("⏹️ Karaoke wurde gestoppt.")
 
 
+@d_bot.event
+async def on_error(event_method: str, /, *args, **kwargs):
+    """Globale Fehlerfalle für Gateway-Events.
+
+    Stellt sicher, dass ein Fehler in einem Event (on_message,
+    on_voice_state_update, ...) den Bot NICHT crashen lässt und
+    keine Fehler-Nachricht an User oder Server gesendet wird.
+    """
+    import traceback
+    traceback.print_exc()
+    print(f"❌ [Bot] Fehler im Event '{event_method}': "
+          f"{type(kwargs.get('error', None)).__name__ if 'error' in kwargs else 'n/a'}")
+
+
 @d_bot.tree.error
 async def on_app_command_error(
     interaction: discord.Interaction,
     error: app_commands.AppCommandError,
 ):
+    # Doppelte Antworten vermeiden (CheckFailure wurde bereits beantwortet)
     if isinstance(error, app_commands.CheckFailure):
         if not interaction.response.is_done():
             await interaction.response.send_message(
                 "❌ Befehl hier nicht verfügbar.", ephemeral=True
             )
-    else:
-        print(f"❌ Command-Fehler: {type(error).__name__}: {error}")
-        try:
-            if not interaction.response.is_done():
-                await interaction.response.send_message(
-                    "❌ Ein Fehler ist aufgetreten.", ephemeral=True
-                )
-            else:
-                await interaction.followup.send(
-                    "❌ Ein Fehler ist aufgetreten.", ephemeral=True
-                )
-        except Exception:
-            pass
+        return
+
+    import traceback
+    traceback.print_exc()
+    print(f"❌ Command-Fehler: {type(error).__name__}: {error}")
+    try:
+        if not interaction.response.is_done():
+            await interaction.response.send_message(
+                "❌ Ein Fehler ist aufgetreten. Bitte später erneut versuchen.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.followup.send(
+                "❌ Ein Fehler ist aufgetreten. Bitte später erneut versuchen.",
+                ephemeral=True,
+            )
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════════════════
@@ -15648,7 +15996,57 @@ def _start_dashboard():
     _flask_app.run(host="0.0.0.0", port=_DASHBOARD_PORT, debug=False, threaded=True, use_reloader=False)
 
 
+def check_system_requirements() -> None:
+    """Prüft System-Voraussetzungen (wichtig auf dem Raspberry Pi 5!).
+
+    Gibt klare Hinweise, wenn Musik-/Voice-Komponenten fehlen,
+    statt dass der Bot erst im Betrieb stumm scheitert.
+    """
+    global FFMPEG_AVAILABLE
+
+    print("")
+    print("── System-Check ─────────────────────────────")
+
+    # Python-Version
+    v = sys.version_info
+    print(f"  🐍 Python: {v.major}.{v.minor}.{v.micro}")
+
+    # FFmpeg (erforderlich für ALLE Musik-Features)
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        FFMPEG_AVAILABLE = True
+        print(f"  🎼 FFmpeg:  ✅ {ffmpeg_path}")
+    else:
+        FFMPEG_AVAILABLE = False
+        print("  🎼 FFmpeg:  ❌ NICHT GEFUNDEN – Musik wird NICHT funktionieren!")
+        print("     Raspberry Pi:  sudo apt update && sudo apt install -y ffmpeg")
+        print("     Ubuntu/Debian: sudo apt update && sudo apt install -y ffmpeg")
+
+    # PyNaCl (erforderlich für Discord-Voice)
+    try:
+        import nacl  # noqa: F401
+        print("  🔐 PyNaCl:  ✅ (Voice-Verschlüsselung)")
+    except ImportError:
+        print("  🔐 PyNaCl:  ❌ fehlt – Voice-Verbindungen werden fehlschlagen!")
+        print("     pip install pynacl")
+
+    # yt-dlp (erforderlich zum Laden der Songs)
+    if MUSIC_ENABLED and YDL:
+        try:
+            print(f"   yt-dlp:  ✅ Version {yt_dlp.version.__version__}")
+        except Exception:
+            print("  🎵 yt-dlp:  ✅ installiert")
+    else:
+        print("  🎵 yt-dlp:  ❌ fehlt oder Musik deaktiviert")
+
+    print("──────────────────────────────────────────────")
+    print("")
+
+
 async def main():
+    # System-Check VOR dem Start (FFmpeg, PyNaCl, yt-dlp, Python)
+    check_system_requirements()
+
     print("")
     print("╔════════════════════════════════════════════════════════╗")
     print("║     🚀 KOMBINIERTER BOT WIRD GESTARTET...              ║")
@@ -15689,10 +16087,14 @@ async def main():
         f"                      ║"
     )
     ### MUSIC MODULE START ###
+    _music_status = (
+        "✅ Aktiv" if MUSIC_ENABLED else "❌ Deaktiviert"
+    )
+    if MUSIC_ENABLED and not FFMPEG_AVAILABLE:
+        _music_status += " (⚠️ ohne FFmpeg!)"
     print(
         f"║  🎵 Musik-Modul:   "
-        f"{'✅ Aktiv' if MUSIC_ENABLED else '❌ Deaktiviert'}"
-        f"                          ║"
+        f"{_music_status:<25}║"
     )
     ### MUSIC MODULE END ###
     print(
@@ -15713,6 +16115,17 @@ async def main():
     if TWITCH_TOKEN and STREAMER_CHANNEL:
         twitch_bot = TwitchBot()
         twitch_task = asyncio.create_task(twitch_bot.start())
+
+        def _twitch_task_done(task: asyncio.Task):
+            # Fehler im Twitch-Task loggen statt sie still verschwinden
+            # zu lassen (z. B. falscher Token → sonst kein Hinweis)
+            if task.cancelled():
+                return
+            exc = task.exception()
+            if exc:
+                print(f"❌ [Twitch] Task-Fehler: {type(exc).__name__}: {exc}")
+
+        twitch_task.add_done_callback(_twitch_task_done)
     else:
         print("⚠️ Twitch-Bot deaktiviert (fehlende Konfiguration)")
 
@@ -15740,7 +16153,7 @@ async def main():
             twitch_task.cancel()
             try:
                 await twitch_task
-            except asyncio.CancelledError:
+            except (asyncio.CancelledError, Exception):
                 pass
         if not d_bot.is_closed():
             await d_bot.close()

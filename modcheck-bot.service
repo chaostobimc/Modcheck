@@ -1,0 +1,40 @@
+# ============================================================
+#  Modcheck Bot – systemd-Service für den Raspberry Pi 5
+#
+#  Installation:
+#    1) WORKING_DIRECTORY + User/Group unten anpassen
+#    2) sudo cp modcheck-bot.service /etc/systemd/system/
+#    3) sudo systemctl daemon-reload
+#    4) sudo systemctl enable --now modcheck-bot
+#
+#  Status/Logs:
+#    systemctl status modcheck-bot
+#    journalctl -u modcheck-bot -f
+# ============================================================
+
+[Unit]
+Description=Modcheck Discord + Twitch Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# ⚠️ Benutzer anpassen (z. B. pi, oder dein eigener User):
+User=pi
+Group=pi
+# ⚠️ Pfad zum Projekt anpassen:
+WorkingDirectory=/home/pi/Modcheck
+ExecStart=/home/pi/Modcheck/venv/bin/python main.py
+# Neustart bei Crash oder Fehler:
+Restart=always
+RestartSec=10
+# Sauberes Herunterfahren:
+TimeoutStopSec=30
+# Ressourcen-Limits (Pi 5: 4/8 GB RAM) – bei Bedarf anpassen:
+MemoryMax=2G
+# Locale für saubere Logs:
+Environment=PYTHONUNBUFFERED=1
+Environment=TZ=Europe/Berlin
+
+[Install]
+WantedBy=multi-user.target
