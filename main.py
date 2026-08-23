@@ -10,6 +10,7 @@ from dotenv import load_dotenv
 from openai import OpenAI
 import asyncio
 import json
+import time
 import datetime
 import calendar
 import re
@@ -9805,8 +9806,25 @@ if MUSIC_ENABLED:
 
 FFMPEG_AVAILABLE = True  # wird in check_system_requirements() geprüft
 
+# YouTube-Stream-URLs (googlevideo.com) verlangen inzwischen einen
+# Referer-Header – ohne diesen bekommt FFmpeg eine 403 Forbidden,
+# egal welcher Player-Client die URL geliefert hat. Deshalb senden
+# wir Referer + User-Agent mit jedem Fetch (für lokale Dateien
+# und andere Streams ist der Header harmlos).
+_YT_HEADERS = (
+    "Referer: https://www.youtube.com/\r\n"
+    "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36\r\n"
+)
+
 FFMPEG_OPTIONS = {
-    'before_options': '-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
+    # shlex-tauglich: Header-Zeichenkette in Anführungszeichen,
+    # damit das \r\n erhalten bleibt
+    'before_options': (
+        "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+        f'-headers "{_YT_HEADERS}"'
+    ),
     'options': '-vn',
 }
 
@@ -9955,14 +9973,22 @@ async def ytdl_extract(query: str, options: dict) -> dict | None:
         return None
 
 
-# Fallback-Ketten für YouTube: Wenn der Standard-Client von YouTube
-# blockiert wird ("Sign in to confirm you're not a bot", abgelaufene
-# Player-URLs), probieren wir andere Player-Clients – das macht die
-# Musik-Playback deutlich robuster, v. a. auf dem Raspberry Pi.
+# Fallback-Kette für YouTube-Player-Clients (Reihenfolge = Priorität):
+#   tv        → zuverlässigste Stream-URLs ohne Sonderbehandlung
+#   android   → sehr zuverlässig
+#   ios       → zuverlässig
+#   web       → braucht Referer-Header (den FFmpeg jetzt mitschickt)
+#   None      → yt-dlp-Standard (inkl. mweb/android_vr) als letztes
+# Jeder Client wird NUR ausprobiert, wenn der vorherige fehlschlägt –
+# auch wenn das Playback selbst eine 403 zurückgibt (neuer Stand:
+# ein erfolgreicher Extract heißt NICHT, dass FFmpeg die URL laden
+# kann).
 YDL_PLAYER_CLIENT_FALLBACKS = [
-    None,  # Standard
-    {'extractor_args': {'youtube': {'player_client': ['android', 'web']}}},
-    {'extractor_args': {'youtube': {'player_client': ['tv', 'web_safari']}}},
+    {'extractor_args': {'youtube': {'player_client': ['tv']}}},
+    {'extractor_args': {'youtube': {'player_client': ['android']}}},
+    {'extractor_args': {'youtube': {'player_client': ['ios']}}},
+    {'extractor_args': {'youtube': {'player_client': ['web']}}},
+    None,  # yt-dlp-Standard
 ]
 
 
@@ -9984,45 +10010,129 @@ def _ydl_resolve_once(webpage_url: str, extra_opts: dict | None = None) -> dict 
         return ydl.extract_info(webpage_url, download=False)
 
 
+def _resolve_with_client(webpage_url: str, extra_opts: dict | None = None) -> tuple[str | None, dict | None]:
+    """Einmaliger yt-dlp-Resolve mit einem bestimmten Client.
+
+    Liefert (stream_url, info). Läuft nur synchron – immer im Executor
+    aufrufen.
+    """
+    ydl_opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'source_address': '0.0.0.0',
+        'extract_flat': False,
+        'nocheckcertificate': True,
+        'cachedir': False,
+        **YDL_TIMEOUTS,
+    }
+    if extra_opts:
+        ydl_opts.update(extra_opts)
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(webpage_url, download=False)
+
+    if not info:
+        return None, None
+
+    stream_url = None
+    if 'url' in info and info['url']:
+        stream_url = info['url']
+    elif 'entries' in info and info['entries']:
+        first = info['entries'][0]
+        if first and first.get('url'):
+            info = first
+            stream_url = first['url']
+    return stream_url, info
+
+
 async def resolve_song_url(song: SongInfo) -> str | None:
     """
-    Stream-URL Auflösung mit Fallback-Kette.
+    Stream-URL Auflösung mit Fallback-Kette (mehrere Player-Clients).
     Holt die Audio-URL und repariert bei Bedarf die Referenz-URL.
     Gibt None zurück wenn alles fehlschlägt (Song wird übersprungen).
+
+    Hinweis: Für das eigentliche Playback nutzt play_next() den
+    robusteren _play_song_robust()-Pfad, der auch auf 403-Fehler
+    beim FFmpeg-Fetch reagiert.
     """
     if not song.webpage_url:
         return None
 
     loop = asyncio.get_running_loop()
-
     for i, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
         try:
-            info = await loop.run_in_executor(
-                None, _ydl_resolve_once, song.webpage_url, extra_opts
+            stream_url, info = await loop.run_in_executor(
+                None, _resolve_with_client, song.webpage_url, extra_opts
             )
         except Exception as e:
             print(f"⚠️ [Music] Resolve Versuch {i + 1} fehlgeschlagen: "
                   f"{type(e).__name__}: {e}")
             continue
 
-        if info:
+        if stream_url and info:
             ref_url = _get_reference_url(info, song.webpage_url)
             if ref_url:
                 song.webpage_url = ref_url
-
-            if 'url' in info and info['url']:
-                return info['url']
-            # Playlist/Andere – ersten Eintrag verwenden
-            if 'entries' in info and info['entries']:
-                first = info['entries'][0]
-                if first and 'url' in first:
-                    ref = _get_reference_url(first, song.webpage_url)
-                    if ref:
-                        song.webpage_url = ref
-                    return first['url']
+            return stream_url
 
     print(f"❌ [Music] Alle Resolve-Versuche fehlgeschlagen: {song.title}")
     return None
+
+
+def _download_song_blocking(webpage_url: str, out_dir: str) -> str | None:
+    """Lädt einen Song als Datei herunter (yt-dlp, läuft im Executor).
+
+    Das ist das ultimative Mittel gegen 403/IP-Wechsel-Problem:
+    yt-dlp lädt die Stream-URL selbst (mit allen Headern & Retries)
+    herunter, FFmpeg spielt nur noch die lokale Datei ab.
+    """
+    import os
+    opts = {
+        'format': 'bestaudio/best',
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'source_address': '0.0.0.0',
+        'nocheckcertificate': True,
+        'cachedir': False,
+        'outtmpl': os.path.join(out_dir, "%(id)s.%(ext)s"),
+        **YDL_TIMEOUTS,
+    }
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(webpage_url, download=False)
+        if not info:
+            return None
+        if 'entries' in info:
+            entries = [e for e in info['entries'] if e]
+            info = entries[0] if entries else None
+        if not info:
+            return None
+        target = ydl.prepare_filename(info)
+        ydl.download([info.get('webpage_url') or webpage_url])
+    return target if target and os.path.exists(target) else None
+
+
+async def download_song_file(webpage_url: str) -> str | None:
+    """Download mit Timeout – liefert Pfad oder None."""
+    import shutil as _shutil
+    tmp_dir = tempfile.mkdtemp(prefix="music_dl_")
+    loop = asyncio.get_running_loop()
+    try:
+        path = await asyncio.wait_for(
+            loop.run_in_executor(None, _download_song_blocking, webpage_url, tmp_dir),
+            timeout=180,
+        )
+    except asyncio.TimeoutError:
+        print("⚠️ [Music] Download-Fallback: Timeout (180 s)")
+        path = None
+    except Exception as e:
+        print(f"⚠️ [Music] Download-Fehler: {type(e).__name__}: {e}")
+        path = None
+    if not path:
+        _shutil.rmtree(tmp_dir, ignore_errors=True)
+        return None
+    return path
 
 async def search_tracks(query: str, limit: int = 1) -> list[dict]:
     """
@@ -10283,6 +10393,255 @@ def _is_playlist_url(query: str) -> bool:
     return _is_url(query) and ('list=' in query or '/playlist' in query)
 
 
+# Wartezeit (Sekunden) bis ein Stream-Versuch als "läuft" gilt –
+# 403-Fehler zeigen sich in dieser Zeit (FFmpeg bricht sofort ab)
+STREAM_CONFIRM_SECONDS = 8
+
+
+def _client_name(extra_opts: dict | None) -> str:
+    """Kurzbezeichnung eines Player-Clients für Log-Meldungen."""
+    if not extra_opts:
+        return "Standard"
+    clients = extra_opts.get("extractor_args", {}).get("youtube", {}).get("player_client", [])
+    return "+".join(clients) if clients else "?"
+
+
+async def _announce_now_playing(
+    state: GuildMusicState,
+    song: SongInfo,
+    text_channel: discord.TextChannel = None,
+) -> None:
+    """History, Dashboard-Now-Playing, Embed und Präsenz aktualisieren."""
+    # History tracken – MUSS eine youtube.com/watch URL sein
+    history_url = _get_reference_url({"webpage_url": song.webpage_url}, song.webpage_url)
+    if history_url and "youtube.com/watch" in history_url:
+        song.webpage_url = history_url
+        state.history.append(history_url)
+        print(f"📝 [Music] History gespeichert: {history_url}")
+
+    # Dashboard: Now Playing
+    try:
+        _req = song.requester.display_name if song.requester else "Autoplay"
+    except Exception:
+        _req = "?"
+    try:
+        dashboard_state.update_now_playing({
+            "title":        song.title,
+            "thumbnail":    song.thumbnail or "",
+            "requester":    _req,
+            "duration_str": song.duration_str,
+            "webpage_url":  song.webpage_url or "",
+            "duration":     song.duration,
+        })
+    except Exception:
+        pass
+
+    # Now Playing Embed senden
+    if text_channel:
+        try:
+            req_mention = song.requester.mention if song.requester else "Unbekannt"
+        except Exception:
+            req_mention = "Unbekannt"
+        title_short = song.title[:80] + "..." if len(song.title) > 80 else song.title
+        embed = discord.Embed(
+            title="🎶 Jetzt spielt",
+            description=f"**{title_short}**",
+            color=COLOR_MUSIC,
+        )
+        embed.add_field(name="⏱️ Dauer", value=song.duration_str, inline=True)
+        embed.add_field(name="👤 Angefragt von", value=req_mention, inline=True)
+        if song.thumbnail:
+            embed.set_thumbnail(url=song.thumbnail)
+        remaining = int(sum(s.duration for s in state.queue))
+        if state.queue:
+            embed.add_field(
+                name="📋 In Warteschlange",
+                value=f"{len(state.queue)} Songs ({remaining // 60}:{remaining % 60:02d})",
+                inline=False,
+            )
+        embed.set_footer(text=f"Autoplay: {'✅ An' if state.autoplay else '❌ Aus'}")
+
+        # Link-Button zum Song
+        view = None
+        if song.webpage_url and song.webpage_url.startswith("http"):
+            class SongLinkView(discord.ui.View):
+                def __init__(self, url: str):
+                    # Timeout statt persistierend – sonst sammelt sich
+                    # für jeden gespielten Song eine View im Speicher an
+                    super().__init__(timeout=1800)
+                    self.add_item(discord.ui.Button(
+                        label="▶️ Auf YouTube öffnen",
+                        url=url,
+                        style=discord.ButtonStyle.link,
+                    ))
+            view = SongLinkView(song.webpage_url)
+
+        try:
+            await text_channel.send(
+                embed=embed,
+                view=view,
+                delete_after=song.duration + 5 if song.duration > 0 else 60,
+            )
+        except Exception as e:
+            print(f"⚠️ [Music] Embed senden fehlgeschlagen: {e}")
+
+    # Bot-Präsenz aktualisieren
+    try:
+        title_short = song.title[:128] if song.title else "Musik"
+        await d_bot.change_presence(
+            activity=discord.Activity(
+                type=discord.ActivityType.listening,
+                name=title_short,
+            )
+        )
+    except Exception as e:
+        print(f"⚠️ [Music] Präsenz-Update fehlgeschlagen: {e}")
+
+
+async def _play_song_robust(
+    state: GuildMusicState,
+    song: SongInfo,
+    text_channel: discord.TextChannel = None,
+) -> bool:
+    """Spielt einen Song ab – mit automatischer Fallback-Kette.
+
+    Reihenfolge:
+      1. Stream-URL mit YouTube-Client tv
+      2. … android → ios → web → Standard
+      3. Datei-Download (yt-dlp) → lokales Playback
+
+    Ein 403 vom Server wird als "früher Fehler" erkannt, sobald
+    FFmpeg sofort abbricht – dann wird automatisch der nächste
+    Client / der Download probiert. Der Song bleibt in der Queue.
+    """
+    voice = state.voice_client
+    if not voice or not voice.is_connected():
+        return False
+
+    # Laufenden Loop direkt einfangen (funktioniert unabhängig vom
+    # Bot-Zustand; state.bot.loop ist nur nach Login verfügbar)
+    loop = asyncio.get_running_loop()
+
+    # ── 1) Stream-Versuche mit verschiedenen Clients ──────────
+    for i, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
+        if not voice.is_connected():
+            return False
+
+        try:
+            stream_url, info = await loop.run_in_executor(
+                None, _resolve_with_client, song.webpage_url, extra_opts
+            )
+        except Exception as e:
+            print(f"⚠️ [Music] Client '{_client_name(extra_opts)}' – "
+                  f"Resolve fehlgeschlagen: {type(e).__name__}: {e}")
+            continue
+
+        if not stream_url or not info:
+            print(f"⚠️ [Music] Client '{_client_name(extra_opts)}' lieferte keine URL")
+            continue
+
+        # Referenz-URL reparieren (stabile Watch-URL für Autoplay/History)
+        ref_url = _get_reference_url(info, song.webpage_url)
+        if ref_url:
+            song.webpage_url = ref_url
+
+        try:
+            source = discord.FFmpegOpusAudio(stream_url, **FFMPEG_OPTIONS)
+        except Exception as e:
+            print(f"⚠️ [Music] FFmpeg-Start fehlgeschlagen "
+                  f"(Client '{_client_name(extra_opts)}'): {e}")
+            continue
+
+        flag = {"confirmed": False, "early_error": None}
+
+        def after_playing(error, _flag=flag):
+            if error is None:
+                # Track beendet → nächsten Song
+                asyncio.run_coroutine_threadsafe(play_next(state, text_channel), loop)
+                return
+            if _flag["confirmed"]:
+                # Fehler NACH Start (Netzwerk-Blip, Reconnect fehlgeschlagen)
+                # → nächsten Song
+                print(f"❌ [Music] Playback-Fehler (nach Start): {error}")
+                asyncio.run_coroutine_threadsafe(play_next(state, text_channel), loop)
+            else:
+                # Früher Fehler (z. B. 403 Forbidden) → nächster Client
+                _flag["early_error"] = error
+
+        try:
+            voice.play(source, after=after_playing)
+        except Exception as e:
+            print(f"⚠️ [Music] play() fehlgeschlagen: {e}")
+            continue
+
+        # Auf frühe Fehler warten (403 zeigt sich sofort);
+        # is_playing() allein reicht NICHT – es ist direkt nach
+        # play() True, auch wenn FFmpeg gleich scheitern wird.
+        deadline = time.monotonic() + STREAM_CONFIRM_SECONDS
+        failed = False
+        while time.monotonic() < deadline:
+            await asyncio.sleep(1.0)
+            if flag["early_error"] is not None:
+                print(f"⚠️ [Music] Stream abgelehnt (Client "
+                      f"'{_client_name(extra_opts)}'): {flag['early_error']}")
+                failed = True
+                break
+
+        if failed:
+            try:
+                voice.stop()
+            except Exception:
+                pass
+            continue
+
+        # ── Playback läuft (oder puffert) ──
+        flag["confirmed"] = True
+        state.consecutive_failures = 0
+        print(f"🎶 [Music] Spielt jetzt: {song.title} "
+              f"(Client '{_client_name(extra_opts)}')")
+        await _announce_now_playing(state, song, text_channel)
+        return True
+
+    # ── 2) Datei-Download als letztes Mittel ───────────────────
+    print(f"🔄 [Music] Alle Stream-Versuche fehlgeschlagen – lade "
+          f"**{song.title}** als Datei herunter …")
+    path = await download_song_file(song.webpage_url)
+    if not path:
+        return False
+    if not voice.is_connected():
+        import shutil as _shutil
+        _shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+        return False
+
+    try:
+        source = discord.FFmpegOpusAudio(path, **FFMPEG_OPTIONS)
+    except Exception as e:
+        print(f"❌ [Music] FFmpeg-Datei-Fehler: {e}")
+        return False
+
+    def after_file(error):
+        if error:
+            print(f"❌ [Music] Datei-Playback-Fehler: {error}")
+        # Datei aufräumen + nächsten Song
+        try:
+            import shutil as _shutil
+            _shutil.rmtree(os.path.dirname(path), ignore_errors=True)
+        except Exception:
+            pass
+        asyncio.run_coroutine_threadsafe(play_next(state, text_channel), loop)
+
+    try:
+        voice.play(source, after=after_file)
+    except Exception as e:
+        print(f"❌ [Music] Datei-play() fehlgeschlagen: {e}")
+        return False
+
+    state.consecutive_failures = 0
+    print(f"🎶 [Music] Spielt jetzt (Datei-Download): {song.title}")
+    await _announce_now_playing(state, song, text_channel)
+    return True
+
+
 async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = None):
     if not state.voice_client or not state.voice_client.is_connected():
         return
@@ -10348,9 +10707,14 @@ async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = 
     state.current = song
     state.reset_idle()
 
-    # Stream-URL auflösen
-    stream_url = await resolve_song_url(song)
-    if not stream_url:
+    # Robustes Playback:
+    #   1) Stream-URL mit mehreren YouTube-Clients (tv → android →
+    #      ios → web → Standard) – auch Server-Ablehnungen (403)
+    #      werden abgefangen, dann wird der nächste Client probiert
+    #   2) Datei-Download (yt-dlp) als letztes Mittel
+    played = await _play_song_robust(state, song, text_channel)
+
+    if not played:
         state.current = None  # wieder "idle"-fähig machen
         failures = state.note_failure()
         if text_channel and failures <= 3:
@@ -10369,128 +10733,6 @@ async def play_next(state: GuildMusicState, text_channel: discord.TextChannel = 
             # Nächsten Song versuchen (ohne Rekursion im Lock)
             asyncio.create_task(play_next(state, text_channel))
         return
-
-    try:
-        source = discord.FFmpegOpusAudio(stream_url, **FFMPEG_OPTIONS)
-    except Exception as e:
-        print(f"❌ [Music] FFmpeg Fehler: {e}")
-        state.current = None
-        failures = state.note_failure()
-        if text_channel and failures <= 3:
-            try:
-                await text_channel.send(
-                    f"❌ FFmpeg-Fehler bei **{song.title}**. Überspringe...",
-                    delete_after=10,
-                )
-            except Exception:
-                pass
-        if state.queue:
-            asyncio.create_task(play_next(state, text_channel))
-        return
-
-    # History tracken – MUSS eine youtube.com/watch URL sein
-    history_url = _get_reference_url({"webpage_url": song.webpage_url}, song.webpage_url)
-
-    if history_url and "youtube.com/watch" in history_url:
-        song.webpage_url = history_url
-        state.history.append(history_url)
-        print(f"📝 [Music] History gespeichert: {history_url}")
-    else:
-        print(
-            f"⚠️ [Music] History übersprungen – keine brauchbare YouTube-Referenz: "
-            f"{song.webpage_url[:80] if song.webpage_url else 'None'}"
-        )
-
-    def after_playing(error):
-        if error:
-            print(f"❌ [Music] Playback-Fehler: {error}")
-        # Nächsten Song im Event-Loop schedulen
-        asyncio.run_coroutine_threadsafe(
-            play_next(state, text_channel), state.bot.loop
-        )
-
-    try:
-        state.voice_client.play(source, after=after_playing)
-        state.consecutive_failures = 0
-        print(f"🎶 [Music] Spielt jetzt: {song.title}")
-        # Dashboard: Now Playing
-        try:
-            _req = song.requester.display_name if song.requester else "Autoplay"
-        except Exception:
-            _req = "?"
-        dashboard_state.update_now_playing({
-            "title":        song.title,
-            "thumbnail":    song.thumbnail or "",
-            "requester":    _req,
-            "duration_str": song.duration_str,
-            "webpage_url":  song.webpage_url or "",
-            "duration":     song.duration,
-        })
-    except Exception as e:
-        print(f"❌ [Music] Play-Fehler: {e}")
-        asyncio.create_task(play_next(state, text_channel))
-        return
-
-    # Now Playing Embed senden + Bot-Präsenz aktualisieren
-    if text_channel:
-        try:
-            req_mention = song.requester.mention if song.requester else "Unbekannt"
-        except Exception:
-            req_mention = "Unbekannt"
-        title_short = song.title[:80] + "..." if len(song.title) > 80 else song.title
-        embed = discord.Embed(
-            title="🎶 Jetzt spielt",
-            description=f"**{title_short}**",
-            color=COLOR_MUSIC,
-        )
-        embed.add_field(name="⏱️ Dauer", value=song.duration_str, inline=True)
-        embed.add_field(name="👤 Angefragt von", value=req_mention, inline=True)
-        if song.thumbnail:
-            embed.set_thumbnail(url=song.thumbnail)
-        remaining = int(sum(s.duration for s in state.queue))
-        if state.queue:
-            embed.add_field(
-                name="📋 In Warteschlange",
-                value=f"{len(state.queue)} Songs ({remaining // 60}:{remaining % 60:02d})",
-                inline=False,
-            )
-        embed.set_footer(text=f"Autoplay: {'✅ An' if state.autoplay else '❌ Aus'}")
-
-        # Link-Button zum Song
-        view = None
-        if song.webpage_url and song.webpage_url.startswith("http"):
-            class SongLinkView(discord.ui.View):
-                def __init__(self, url: str):
-                    # Timeout statt persistierend – sonst sammelt sich
-                    # für jeden gespielten Song eine View im Speicher an
-                    super().__init__(timeout=1800)
-                    self.add_item(discord.ui.Button(
-                        label="▶️ Auf YouTube öffnen",
-                        url=url,
-                        style=discord.ButtonStyle.link,
-                    ))
-            view = SongLinkView(song.webpage_url)
-
-        try:
-            await text_channel.send(
-                embed=embed,
-                view=view,
-                delete_after=song.duration + 5 if song.duration > 0 else 60,
-            )
-        except Exception as e:
-            print(f"⚠️ [Music] Embed senden fehlgeschlagen: {e}")
-
-    # Bot-Präsenz aktualisieren
-    try:
-        title_short = song.title[:128] if song.title else "Musik"
-        await d_bot.change_presence(
-            activity=discord.Activity(
-                type=discord.ActivityType.listening,
-                name=title_short,
-            )
-        )
-    except Exception as e:
-        print(f"⚠️ [Music] Präsenz-Update fehlgeschlagen: {e}")
 
 # ── Queue Pagination View ────────────────────────────────
 

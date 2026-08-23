@@ -103,7 +103,18 @@ sudo systemctl restart modcheck-bot   # Neustart
 - Der Bot verlässt den Voice-Kanal nach `MUSIC_IDLE_TIMEOUT` Sekunden
   Inaktivität oder wenn der Kanal leer ist.
 
-**Wenn die Musik nicht läuft, prüfe in dieser Reihenfolge:**
+**Automatische Fallback-Kette gegen „403 Forbidden" / YouTube-Blockaden:**
+
+1. Stream-URL über YouTube-Client `tv`
+2. … dann `android` → `ios` → `web` → Standard
+3. Lädt den Song als Datei (yt-dlp) herunter und spielt lokal ab
+
+Dazu schickt FFmpeg bei jedem Stream-Request einen `Referer`-Header mit –
+ohne diesen antwortet YouTube auf viele Stream-URLs mit **403 Forbidden**.
+Alles wird automatisch durchprobiert; im Log siehst du unter
+`[Music]`, welcher Weg genutzt wurde.
+
+**Wenn die Musik trotzdem nicht läuft, prüfe in dieser Reihenfolge:**
 
 1. `ffmpeg` installiert? → `which ffmpeg` (sonst: `sudo apt install -y ffmpeg`)
 2. Bot hat **Verbinden + Sprechen** in dem Voice-Kanal?
