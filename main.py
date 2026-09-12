@@ -16019,8 +16019,37 @@ def _gambling_lb(s, limit=10):
     items = [{"uid":k,"username":v.get("username",k),"wins":v.get("wins",0),"losses":v.get("losses",0),"profit":v.get("profit",0)} for k,v in s.get("gambling",{}).items()]
     return sorted(items, key=lambda x: x["profit"], reverse=True)[:limit]
 
+def _lan_ipv4() -> str:
+    host = (os.getenv("DASHBOARD_HOST") or os.getenv("PI_IP") or "").strip()
+    if host:
+        return host.split("://")[-1].split("/")[0].split(":")[0]
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.4)
+        s.connect(("1.1.1.1", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+def _usable_redirect(uri: str) -> str:
+    u = (uri or "").strip()
+    low = u.lower()
+    if not u:
+        return ""
+    if any(x in low for x in ("ngrok", "loca.lt", "trycloudflare", "cloudflared")):
+        return ""
+    return u
+
 def _get_redirect_uri():
-    return _REDIRECT_URI_ENV or f"http://localhost:{_DASHBOARD_PORT}/auth/callback"
+    env = _usable_redirect(_REDIRECT_URI_ENV)
+    if env:
+        return env
+    return f"http://{_lan_ipv4()}:{_DASHBOARD_PORT}/auth/callback"
 
 def _bh(): return {"Authorization": f"Bot {DISCORD_TOKEN}"}
 
@@ -16230,7 +16259,7 @@ def _api_settings_post():
 @_flask_app.route("/login")
 def _login():
     if not _DISCORD_CLIENT_ID or not _DISCORD_CLIENT_SECRET:
-        return _render("login_no_oauth.html")
+        return _render("login_no_oauth.html", redirect_uri=_get_redirect_uri())
     return _render("login.html", oauth_url=_oauth_url(), redirect_uri=_get_redirect_uri(), error_msg=None)
 
 @_flask_app.route("/auth/callback")
@@ -16438,7 +16467,7 @@ async def main():
     # ── Dashboard-Thread starten ────────────────────────
     _dash_thread = threading.Thread(target=_start_dashboard, daemon=True)
     _dash_thread.start()
-    print(f"🌐 Dashboard: http://localhost:{_DASHBOARD_PORT}")
+    print(f"🌐 Hub: http://{_lan_ipv4()}:{_DASHBOARD_PORT}/  | Admin: /admin")
 
     twitch_task = None
     if TWITCH_TOKEN and STREAMER_CHANNEL:

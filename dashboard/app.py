@@ -237,11 +237,37 @@ def get_now_playing() -> dict | None:
         return getattr(_bot_state, "now_playing", None)
     return _now_playing
 
-# ── Redirect URI ────────────────────────────────────────────
+def _lan_ipv4() -> str:
+    host = (os.getenv("DASHBOARD_HOST") or os.getenv("PI_IP") or "").strip()
+    if host:
+        return host.split("://")[-1].split("/")[0].split(":")[0]
+    try:
+        import socket
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(0.4)
+        s.connect(("1.1.1.1", 80))
+        ip = s.getsockname()[0]
+        s.close()
+        if ip and not ip.startswith("127."):
+            return ip
+    except Exception:
+        pass
+    return "127.0.0.1"
+
+def _usable_redirect(uri: str) -> str:
+    u = (uri or "").strip()
+    low = u.lower()
+    if not u:
+        return ""
+    if any(x in low for x in ("ngrok", "loca.lt", "trycloudflare", "cloudflared")):
+        return ""
+    return u
+
 def get_redirect_uri() -> str:
-    if _REDIRECT_URI_ENV:
-        return _REDIRECT_URI_ENV
-    return f"http://localhost:{DASHBOARD_PORT}/auth/callback"
+    env = _usable_redirect(_REDIRECT_URI_ENV)
+    if env:
+        return env
+    return f"http://{_lan_ipv4()}:{DASHBOARD_PORT}/auth/callback"
 
 # ── Discord API ──────────────────────────────────────────────
 def _bh() -> dict:
@@ -586,7 +612,7 @@ def api_channels():
 @app.route("/login")
 def login():
     if not DISCORD_CLIENT_ID or not DISCORD_CLIENT_SECRET:
-        return render_template("login_no_oauth.html")
+        return render_template("login_no_oauth.html", redirect_uri=get_redirect_uri())
     return render_template("login.html",
         oauth_url=discord_oauth_url(),
         redirect_uri=get_redirect_uri(),
@@ -680,5 +706,6 @@ if __name__ == "__main__":
     print(f"║  Redirect URI: {get_redirect_uri()[:28]:<28} ║")
     print(f"║  Port        : {DASHBOARD_PORT:<28} ║")
     print(f"╚══════════════════════════════════════════════╝")
-    print(f"\n  Dashboard: http://localhost:{DASHBOARD_PORT}\n")
+    print(f"\n  Hub:   http://{_lan_ipv4()}:{DASHBOARD_PORT}/")
+    print(f"  Admin: http://{_lan_ipv4()}:{DASHBOARD_PORT}/admin\n")
     app.run(host="0.0.0.0", port=DASHBOARD_PORT, debug=DASHBOARD_DEBUG, threaded=True)

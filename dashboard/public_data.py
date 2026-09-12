@@ -31,6 +31,16 @@ def today_iso() -> str:
     return str(today_local())
 
 
+def fmt_date(iso: str | None) -> str:
+    if not iso:
+        return "—"
+    try:
+        d = datetime.date.fromisoformat(iso[:10])
+        return d.strftime("%d.%m.%Y")
+    except ValueError:
+        return iso
+
+
 def _load_json(path: str, default: Any) -> Any:
     try:
         with open(path, "r", encoding="utf-8") as f:
@@ -89,18 +99,18 @@ def is_present(streams: dict, uid: str, date_str: str, absences: dict | None = N
     return is_user_absent(uid_s, date_str, absences)
 
 
-def activity_grade(percentage: float) -> tuple[str, str]:
+def activity_grade(percentage: float) -> str:
     if percentage >= 90:
-        return "S+", "🔥"
+        return "S+"
     if percentage >= 75:
-        return "A", "⭐"
+        return "A"
     if percentage >= 60:
-        return "B", "👍"
+        return "B"
     if percentage >= 40:
-        return "C", "📊"
+        return "C"
     if percentage >= 20:
-        return "D", "⚠️"
-    return "F", "💤"
+        return "D"
+    return "F"
 
 
 def current_streak(streams: dict, uid: str, absences: dict | None = None) -> int:
@@ -135,10 +145,10 @@ def longest_streak(streams: dict, uid: str, absences: dict | None = None) -> int
 def fmt_voice(seconds: int) -> str:
     seconds = int(seconds or 0)
     h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
+    m, _s = divmod(rem, 60)
     if h:
         return f"{h}h {m:02d}m"
-    return f"{m}m {s:02d}s"
+    return f"{m}m"
 
 
 def _month_heatmap(streams: dict, uid: str, year: int, month: int, absences: dict) -> list[dict]:
@@ -181,64 +191,91 @@ def build_public_payload(guild: dict | None = None, now_playing: dict | None = N
     msg_counts = data.get("message_counts", {})
     today = today_local()
     today_s = str(today)
+    year, month = today.year, today.month
+    last_month = month - 1 or 12
+    last_month_year = year if month > 1 else year - 1
+
+    name_of = {
+        uid: (info.get("display_name") or info.get("twitch_name") or uid)
+        for uid, info in users.items()
+    }
 
     real_days = [d for d, lst in streams.items() if lst]
     real_days_sorted = sorted(real_days)
     total_stream_days = len(real_days)
+    this_month_days = [d for d in real_days if d.startswith(f"{year}-{month:02d}-")]
+    last_month_days = [d for d in real_days if d.startswith(f"{last_month_year}-{last_month:02d}-")]
 
-    live_guess = today_s in streams  # tracker legt den Tag nur an, wenn live
+    live_guess = bool(streams.get(today_s))
+
+    hour_totals = [0] * 24
+    weekday_counts = [0] * 7
+    for d in real_days:
+        try:
+            weekday_counts[datetime.date.fromisoformat(d).weekday()] += 1
+        except ValueError:
+            pass
 
     roster = []
     for uid, info in users.items():
         present_days = sum(1 for d in real_days if is_present(streams, uid, d, absences))
         pct = (present_days / total_stream_days * 100) if total_stream_days else 0
-        grade, emoji = activity_grade(pct)
         last_seen = next((d for d in reversed(real_days_sorted) if is_present(streams, uid, d, absences)), None)
         first_seen = next((d for d in real_days_sorted if is_present(streams, uid, d, absences)), None)
 
         twitch_msgs = 0
-        hours: dict[str, int] = {}
+        hours = [0] * 24
         for day, day_data in msg_counts.items():
             if uid in day_data:
                 twitch_msgs += int(day_data[uid].get("count", 0) or 0)
                 for h, c in (day_data[uid].get("hours") or {}).items():
-                    hours[h] = hours.get(h, 0) + int(c)
-        peak_hour = max(hours, key=hours.get) if hours else None
+                    try:
+                        hi = int(h)
+                    except (TypeError, ValueError):
+                        continue
+                    if 0 <= hi <= 23:
+                        hours[hi] += int(c)
+                        hour_totals[hi] += int(c)
 
+        month_present = sum(1 for d in this_month_days if is_present(streams, uid, d, absences))
+        month_excused = sum(1 for d in this_month_days if is_user_absent(uid, d, absences))
         discord_msgs = int((stats.get("messages") or {}).get(uid, {}).get("total", 0) or 0)
         voice_secs = int((stats.get("voice_time") or {}).get(uid, 0) or 0)
+        peak_hour = hours.index(max(hours)) if any(hours) else None
+        avg_twitch = round(twitch_msgs / present_days, 1) if present_days else 0
 
         roster.append({
             "uid": uid,
-            "display_name": info.get("display_name") or info.get("twitch_name") or uid,
+            "display_name": name_of[uid],
             "twitch_name": info.get("twitch_name", ""),
             "present": present_days,
             "absent": max(0, total_stream_days - present_days),
             "pct": round(pct, 1),
-            "grade": grade,
-            "grade_emoji": emoji,
+            "grade": activity_grade(pct),
             "streak": current_streak(streams, uid, absences),
             "longest_streak": longest_streak(streams, uid, absences),
             "last_seen": last_seen,
+            "last_seen_fmt": fmt_date(last_seen),
             "first_seen": first_seen,
+            "first_seen_fmt": fmt_date(first_seen),
             "twitch_messages": twitch_msgs,
+            "avg_twitch": avg_twitch,
             "discord_messages": discord_msgs,
             "voice_seconds": voice_secs,
             "voice_label": fmt_voice(voice_secs),
-            "peak_hour": int(peak_hour) if peak_hour is not None else None,
+            "peak_hour": peak_hour,
+            "hours": hours,
+            "month_present": month_present,
+            "month_total": len(this_month_days),
+            "month_excused": month_excused,
             "today": is_present(streams, uid, today_s, absences) if today_s in streams else False,
+            "heatmap": _month_heatmap(streams, uid, year, month, absences),
         })
 
     roster.sort(key=lambda x: (x["present"], x["twitch_messages"], x["pct"]), reverse=True)
     for i, row in enumerate(roster, 1):
         row["rank"] = i
 
-    # Heatmap current month for top users + all
-    year, month = today.year, today.month
-    for row in roster:
-        row["heatmap"] = _month_heatmap(streams, row["uid"], year, month, absences)
-
-    # Stream calendar last 16 weeks
     weeks = []
     start = today - datetime.timedelta(days=today.weekday() + 15 * 7)
     for w in range(16):
@@ -263,6 +300,7 @@ def build_public_payload(guild: dict | None = None, now_playing: dict | None = N
         monthly.append({
             "month": m,
             "name": MONTH_NAMES[m][:3],
+            "full": MONTH_NAMES[m],
             "streams": len(days_m),
             "msgs": sum(
                 int(u.get("count", 0) or 0)
@@ -273,18 +311,16 @@ def build_public_payload(guild: dict | None = None, now_playing: dict | None = N
 
     daily_msgs = []
     da = stats.get("daily_active") or {}
-    for i in range(13, -1, -1):
+    for i in range(29, -1, -1):
         d = str(today - datetime.timedelta(days=i))
-        daily_msgs.append({"date": d[5:], "count": sum((da.get(d) or {}).values())})
+        daily_msgs.append({"date": d[5:], "full": fmt_date(d), "count": sum((da.get(d) or {}).values())})
 
     daily_voice = []
     vd = stats.get("voice_days") or {}
-    for i in range(13, -1, -1):
+    for i in range(29, -1, -1):
         d = str(today - datetime.timedelta(days=i))
-        daily_voice.append({
-            "date": d[5:],
-            "seconds": sum(ud.get(d, 0) for ud in vd.values()),
-        })
+        secs = sum(ud.get(d, 0) for ud in vd.values())
+        daily_voice.append({"date": d[5:], "full": fmt_date(d), "seconds": secs, "label": fmt_voice(secs)})
 
     msg_lb = sorted(
         [
@@ -293,13 +329,13 @@ def build_public_payload(guild: dict | None = None, now_playing: dict | None = N
         ],
         key=lambda x: x["total"],
         reverse=True,
-    )[:12]
+    )[:15]
 
     voice_lb = sorted(
         [
             {
                 "uid": uid,
-                "username": (stats.get("messages") or {}).get(uid, {}).get("username", f"User {uid}"),
+                "username": (stats.get("messages") or {}).get(uid, {}).get("username", name_of.get(uid, uid)),
                 "seconds": secs,
                 "label": fmt_voice(secs),
             }
@@ -307,21 +343,50 @@ def build_public_payload(guild: dict | None = None, now_playing: dict | None = N
         ],
         key=lambda x: x["seconds"],
         reverse=True,
-    )[:12]
+    )[:15]
 
-    total_twitch_msgs = sum(
-        int(u.get("count", 0) or 0)
-        for day in msg_counts.values()
-        for u in day.values()
-    )
+    recent_streams = []
+    for ds in reversed(real_days_sorted[-20:]):
+        ids = streams.get(ds) or []
+        try:
+            wd = WEEKDAY_SHORT[datetime.date.fromisoformat(ds).weekday()]
+        except ValueError:
+            wd = ""
+        recent_streams.append({
+            "date": ds,
+            "date_fmt": fmt_date(ds),
+            "weekday": wd,
+            "count": len(ids),
+            "names": [name_of.get(str(u), str(u)) for u in ids],
+        })
+
+    today_names = [name_of.get(str(u), str(u)) for u in (streams.get(today_s) or [])]
+    total_twitch_msgs = sum(int(u.get("count", 0) or 0) for day in msg_counts.values() for u in day.values())
+    avg_mods = round(sum(len(streams[d]) for d in real_days) / total_stream_days, 1) if total_stream_days else 0
+
+    joins = []
+    for j in reversed(stats.get("joins") or []):
+        joins.append({
+            "name": j.get("name", "?"),
+            "age_days": j.get("age_days", 0),
+            "ts": j.get("ts", ""),
+            "ts_fmt": fmt_date((j.get("ts") or "")[:10]),
+            "avatar": j.get("avatar") or "",
+        })
+        if len(joins) >= 12:
+            break
 
     guild = guild or {}
+    first_stream = fmt_date(real_days_sorted[0]) if real_days_sorted else "—"
+    last_stream = fmt_date(real_days_sorted[-1]) if real_days_sorted else "—"
+
     return {
-        "generated_at": datetime.datetime.now(DE_TZ).isoformat(),
+        "generated_at": datetime.datetime.now(DE_TZ).strftime("%d.%m.%Y %H:%M"),
         "today": today_s,
+        "today_fmt": fmt_date(today_s),
         "month_name": MONTH_NAMES[month],
         "year": year,
-        "live": bool(live_guess and any(is_present(streams, u, today_s, absences) for u in users)),
+        "live": live_guess,
         "streamer": os.getenv("STREAMER_CHANNEL", "").lower(),
         "invite": os.getenv("DISCORD_INVITE_URL", ""),
         "guild": {
@@ -334,20 +399,29 @@ def build_public_payload(guild: dict | None = None, now_playing: dict | None = N
         "kpis": {
             "mods": len(users),
             "stream_days": total_stream_days,
+            "month_streams": len(this_month_days),
+            "last_month_streams": len(last_month_days),
             "today_present": len(streams.get(today_s) or []),
             "twitch_messages": total_twitch_msgs,
             "discord_messages": sum(v.get("total", 0) for v in (stats.get("messages") or {}).values()),
             "voice_seconds": sum((stats.get("voice_time") or {}).values()),
             "voice_label": fmt_voice(sum((stats.get("voice_time") or {}).values())),
             "joins": len(stats.get("joins") or []),
+            "avg_mods": avg_mods,
+            "first_stream": first_stream,
+            "last_stream": last_stream,
         },
+        "today_names": today_names,
         "roster": roster,
         "weeks": weeks,
         "weekdays": WEEKDAY_SHORT,
+        "weekday_counts": weekday_counts,
+        "hours": hour_totals,
         "monthly": monthly,
         "daily_messages": daily_msgs,
         "daily_voice": daily_voice,
         "msg_leaderboard": msg_lb,
         "voice_leaderboard": voice_lb,
-        "recent_joins": list(reversed(stats.get("joins") or []))[:8],
+        "recent_streams": recent_streams,
+        "recent_joins": joins,
     }

@@ -3,152 +3,152 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>{{ payload.guild.name }} — Activity Hub</title>
-  <meta name="description" content="Live Activity Hub für Discord, Twitch-Streams, Voice und Mod-Tracking.">
+  <title>{{ payload.guild.name }} – Aktivität</title>
+  <meta name="description" content="Anwesenheit, Streams, Chat und Voice von {{ payload.guild.name }}.">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@300;400;500;600;700;800&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="{{ url_for('static', filename='css/public.css') }}">
 </head>
 <body>
-  <div class="aurora"></div>
-  <div class="noise"></div>
-  <div class="wrap">
-    <nav class="top">
-      <a class="brand" href="/">
-        {% if payload.guild.icon_url %}
-          <img src="{{ payload.guild.icon_url }}" alt="">
-        {% else %}
-          <div class="mark">BG</div>
-        {% endif %}
-        <span>{{ payload.guild.name }}</span>
-      </a>
-      <div class="nav-links">
-        <a href="#pulse">Pulse</a>
-        <a href="#mods">Mods</a>
-        <a href="#streams">Streams</a>
-        <a href="#voice">Voice</a>
-      </div>
-      <div class="nav-cta">
-        {% if payload.invite %}
-          <a class="btn primary" href="{{ payload.invite }}" target="_blank" rel="noopener">Discord beitreten</a>
-        {% endif %}
-        {% if payload.streamer %}
-          <a class="btn" href="https://twitch.tv/{{ payload.streamer }}" target="_blank" rel="noopener">Twitch</a>
-        {% endif %}
-        <a class="btn" href="/admin">Admin</a>
-      </div>
+  <header class="bar">
+    <a class="brand" href="/">
+      {% if payload.guild.icon_url %}
+        <img src="{{ payload.guild.icon_url }}" alt="">
+      {% else %}
+        <span class="mark">{{ payload.guild.name[:1] }}</span>
+      {% endif %}
+      <span>
+        <strong>{{ payload.guild.name }}</strong>
+        <small>Aktivität · Europe/Berlin</small>
+      </span>
+    </a>
+    <nav>
+      <a href="#mods">Mods</a>
+      <a href="#streams">Streams</a>
+      <a href="#chat">Chat</a>
+      <a href="#voice">Voice</a>
     </nav>
+    <div class="bar-right">
+      <span class="live {% if not payload.live %}off{% endif %}">{% if payload.live %}Live{% else %}Offline{% endif %}</span>
+      {% if payload.streamer %}
+        <a class="link" href="https://twitch.tv/{{ payload.streamer }}" target="_blank" rel="noopener">twitch.tv/{{ payload.streamer }}</a>
+      {% endif %}
+      {% if payload.invite %}
+        <a class="btn" href="{{ payload.invite }}" target="_blank" rel="noopener">Discord</a>
+      {% endif %}
+      <a class="btn ghost" href="/admin">Admin</a>
+    </div>
+  </header>
 
-    <header class="hero">
-      <div class="hero-bg" style="background-image:url('{{ url_for('static', filename='img/hero.jpg') }}')"></div>
-      <div class="hero-copy">
-        <div class="kicker">
-          <span class="pulse {% if not payload.live %}off{% endif %}"></span>
-          {% if payload.live %}LIVE SIGNAL{% else %}OFFLINE · ARCHIVE MODE{% endif %}
-          · {{ payload.today }}
-        </div>
-        <h1>Der Raum, in dem<br><em>Community atmet.</em></h1>
-        <p class="lede">
-          Öffentlicher Activity Hub für Discord, Twitch-Chat und Voice.
-          Jeder Stream-Tag, jede Anwesenheit, jede Streak — in Berlin-Zeit, ohne Phantom-Tage.
-        </p>
-        <div class="hero-actions">
-          <a class="btn primary" href="#mods">Leaderboard öffnen</a>
-          <a class="btn" href="#streams">Stream-Kalender</a>
-        </div>
+  <main>
+    <section class="intro">
+      <div>
+        <h1>Server-Statistiken</h1>
+        <p>{{ payload.today_fmt }} · Tracking seit {{ payload.kpis.first_stream }} · letzter Stream {{ payload.kpis.last_stream }}</p>
       </div>
-    </header>
+      {% if payload.today_names %}
+        <p class="today-line">Heute im Stream: {{ payload.today_names | join(', ') }}</p>
+      {% endif %}
+    </section>
 
-    <section class="section" id="pulse">
-      <h2>Server-Pulse</h2>
-      <p class="sub">Live-Zahlen aus Tracking — Discord-Chat, Voice und Twitch-Anwesenheit.</p>
-      <div class="kpis" id="kpis">
-        <article class="kpi"><div class="label">Mitglieder</div><div class="val" data-count="{{ payload.guild.member_count }}">{{ payload.guild.member_count }}</div><div class="hint">{{ payload.guild.online_count }} online</div></article>
-        <article class="kpi"><div class="label">Mods</div><div class="val" data-count="{{ payload.kpis.mods }}">{{ payload.kpis.mods }}</div><div class="hint">verknüpft</div></article>
-        <article class="kpi"><div class="label">Stream-Tage</div><div class="val" data-count="{{ payload.kpis.stream_days }}">{{ payload.kpis.stream_days }}</div><div class="hint">echte Lives</div></article>
-        <article class="kpi"><div class="label">Twitch-Msgs</div><div class="val" data-count="{{ payload.kpis.twitch_messages }}">{{ payload.kpis.twitch_messages }}</div><div class="hint">im Stream-Chat</div></article>
-        <article class="kpi"><div class="label">Discord-Msgs</div><div class="val" data-count="{{ payload.kpis.discord_messages }}">{{ payload.kpis.discord_messages }}</div><div class="hint">Server-Chat</div></article>
-        <article class="kpi"><div class="label">Voice</div><div class="val">{{ payload.kpis.voice_label }}</div><div class="hint">gesamt</div></article>
+    <section class="kpis" id="pulse">
+      <article><span>Mitglieder</span><b>{{ payload.guild.member_count }}</b><i>{{ payload.guild.online_count }} online</i></article>
+      <article><span>Mods</span><b>{{ payload.kpis.mods }}</b><i>Twitch verknüpft</i></article>
+      <article><span>Stream-Tage</span><b>{{ payload.kpis.stream_days }}</b><i>{{ payload.kpis.month_streams }} in {{ payload.month_name }} ({{ payload.kpis.last_month_streams }} Vormonat)</i></article>
+      <article><span>Mods / Stream</span><b>{{ payload.kpis.avg_mods }}</b><i>Schnitt</i></article>
+      <article><span>Twitch-Chat</span><b>{{ payload.kpis.twitch_messages }}</b><i>Nachrichten</i></article>
+      <article><span>Discord-Chat</span><b>{{ payload.kpis.discord_messages }}</b><i>Nachrichten</i></article>
+      <article><span>Voice</span><b>{{ payload.kpis.voice_label }}</b><i>gesamt</i></article>
+    </section>
+
+    <section class="grid" id="streams">
+      <article class="panel">
+        <h2>Letzte Streams</h2>
+        <table class="tbl">
+          <thead><tr><th>Datum</th><th>Tag</th><th>Mods</th><th>Anwesend</th></tr></thead>
+          <tbody id="streams-body"></tbody>
+        </table>
+      </article>
+      <div class="stack">
+        <article class="panel">
+          <h2>Streams nach Wochentag</h2>
+          <div class="bars" id="weekday-bars"></div>
+        </article>
+        <article class="panel">
+          <h2>Twitch-Chat nach Stunde (Berlin)</h2>
+          <div class="hours" id="hour-bars"></div>
+        </article>
       </div>
     </section>
 
-    <section class="section" id="streams">
-      <div class="bento">
-        <article class="card">
-          <h3>16 Wochen Stream-Wärme</h3>
-          <div class="weeks" id="weeks"></div>
-          <div class="legend">
-            <span><i style="background:#7c6cff"></i>Stream</span>
-            <span><i style="background:rgba(255,255,255,.06)"></i>kein Stream</span>
-            <span>Mo → So von oben nach unten</span>
-          </div>
-        </article>
-        <article class="card">
-          <h3>Discord-Nachrichten · 14 Tage</h3>
-          <div class="chart" id="msg-chart"></div>
-        </article>
-      </div>
-    </section>
-
-    <section class="section" id="mods">
-      <h2>Mod-Aktivität</h2>
-      <p class="sub">Nur echte Stream-Tage zählen. Entschuldigte Absenzen schützen die Streak, erzeugen aber keine Fake-Streams.</p>
-      <article class="card" style="overflow:auto">
-        <table class="roster">
+    <section class="panel" id="mods">
+      <h2>Mod-Anwesenheit</h2>
+      <p class="note">Nur Tage mit echtem Stream. Abgemeldet zählt für die Streak, legt aber keinen Stream-Tag an.</p>
+      <div class="table-wrap">
+        <table class="tbl sticky">
           <thead>
             <tr>
-              <th>#</th><th>Mod</th><th>Note</th><th>Quote</th><th>Streak</th><th>Twitch</th><th>Voice</th><th>{{ payload.month_name }}</th>
+              <th>#</th><th>Name</th><th>Note</th><th>Quote</th><th>Streak</th>
+              <th>{{ payload.month_name }}</th><th>Twitch</th><th>Ø / Stream</th>
+              <th>Discord</th><th>Voice</th><th>Zuletzt</th><th>{{ payload.month_name }}</th>
             </tr>
           </thead>
           <tbody id="roster-body"></tbody>
         </table>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <h2>{{ payload.year }} – Streams pro Monat</h2>
+        <div class="months" id="months"></div>
+      </article>
+      <article class="panel">
+        <h2>16 Wochen</h2>
+        <div class="weeks" id="weeks"></div>
+        <p class="legend"><span class="swatch on"></span> Stream <span class="swatch"></span> kein Stream · Mo–So von oben nach unten</p>
       </article>
     </section>
 
-    <section class="section" id="voice">
-      <div class="bento">
-        <article class="card">
-          <h3>Voice-Zeit · 14 Tage</h3>
-          <div class="chart" id="voice-chart"></div>
-        </article>
-        <article class="card">
-          <h3>Voice-Leaderboard</h3>
-          <div class="lb" id="voice-lb"></div>
-        </article>
-      </div>
+    <section class="grid" id="chat">
+      <article class="panel">
+        <h2>Discord-Nachrichten · 30 Tage</h2>
+        <div class="chart" id="msg-chart"></div>
+      </article>
+      <article class="panel">
+        <h2>Discord Chat</h2>
+        <ol class="rank" id="msg-lb"></ol>
+      </article>
     </section>
 
-    <section class="section">
-      <h2>{{ payload.year }} in Monaten</h2>
-      <p class="sub">Wie oft wirklich gestreamt wurde — leere Kalendertage zählen nicht.</p>
-      <div class="monthgrid" id="months"></div>
+    <section class="grid" id="voice">
+      <article class="panel">
+        <h2>Voice-Zeit · 30 Tage</h2>
+        <div class="chart voice" id="voice-chart"></div>
+      </article>
+      <article class="panel">
+        <h2>Voice</h2>
+        <ol class="rank" id="voice-lb"></ol>
+      </article>
     </section>
 
-    <section class="section">
-      <div class="bento">
-        <article class="card">
-          <h3>Discord Chat-Leaderboard</h3>
-          <div class="lb" id="msg-lb"></div>
-        </article>
-        <article class="card">
-          <h3>Zuletzt beigetreten</h3>
-          <div class="lb" id="joins"></div>
-        </article>
-      </div>
+    <section class="panel">
+      <h2>Neue Mitglieder</h2>
+      <ol class="rank avatars" id="joins"></ol>
     </section>
+  </main>
 
-    <footer class="site">
-      <div>© {{ payload.year }} {{ payload.guild.name }} · Activity Hub · Europe/Berlin</div>
-      <div>
-        <a href="/nutzungsbedingungen">Nutzungsbedingungen</a>
-        · <a href="/datenschutz">Datenschutz</a>
-        · Stand <span id="stamp">{{ payload.generated_at }}</span>
-      </div>
-    </footer>
-  </div>
+  <footer class="foot">
+    <span>{{ payload.guild.name }}</span>
+    <span>Stand <span id="stamp">{{ payload.generated_at }}</span></span>
+    <span>
+      <a href="/nutzungsbedingungen">Nutzungsbedingungen</a>
+      · <a href="/datenschutz">Datenschutz</a>
+    </span>
+  </footer>
 
-  <div class="modal-bg" id="modal">
+  <div class="modal-bg" id="modal" hidden>
     <div class="modal" id="modal-inner"></div>
   </div>
 
