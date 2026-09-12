@@ -20,6 +20,11 @@ import aiohttp
 from collections import deque
 from urllib.parse import urlparse, quote
 from functools import wraps
+try:
+    from zoneinfo import ZoneInfo
+    DE_TZ = ZoneInfo('Europe/Berlin')
+except Exception:
+    DE_TZ = datetime.timezone(datetime.timedelta(hours=1))
 
 # Dashboard-Imports (Flask läuft im selben Prozess in einem Thread)
 from flask import (Flask as _Flask, render_template as _render,
@@ -86,16 +91,39 @@ class _StatsTracker:
                 "deletions": [], "joins": [],
             }
 
-    def _save(self):
+    def _save(self, force: bool = False):
+        now = time.time()
+        if not force and now - getattr(self, "_last_save", 0) < 5:
+            self._dirty = True
+            return
         try:
-            with open(_STATS_FILE, "w", encoding="utf-8") as f:
-                json.dump(self._data, f, indent=2, ensure_ascii=False)
+            directory = os.path.dirname(os.path.abspath(_STATS_FILE)) or "."
+            fd, tmp = tempfile.mkstemp(prefix=".stats-", suffix=".json", dir=directory)
+            try:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    json.dump(self._data, f, indent=2, ensure_ascii=False)
+                    f.flush()
+                    os.fsync(f.fileno())
+                os.replace(tmp, _STATS_FILE)
+            except Exception:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            self._dirty = False
+            self._last_save = now
         except Exception as e:
             print(f"[Stats] Speicherfehler: {e}")
 
+    def flush(self):
+        with self._lock:
+            if getattr(self, "_dirty", False):
+                self._save(force=True)
+
     def add_message(self, user_id: int, username: str):
         uid = str(user_id)
-        today = datetime.date.today().isoformat()
+        today = datetime.datetime.now(DE_TZ).date().isoformat()
         with self._lock:
             m = self._data["messages"]
             if uid not in m:
@@ -127,28 +155,42 @@ class _StatsTracker:
         return result
 
     def voice_join(self, user_id: int):
-        import time
-        self._voice_sessions[user_id] = time.time()
+        with self._lock:
+            if user_id not in self._voice_sessions:
+                self._voice_sessions[user_id] = time.time()
 
     def voice_leave(self, user_id: int, username: str):
-        import time
-        if user_id not in self._voice_sessions:
-            return
-        duration = int(time.time() - self._voice_sessions.pop(user_id))
-        if duration < 5:
-            return
-        uid = str(user_id)
-        today = datetime.date.today().isoformat()
         with self._lock:
-            self._data["voice_time"][uid] = self._data["voice_time"].get(uid, 0) + duration
-            if uid not in self._data["voice_days"]:
-                self._data["voice_days"][uid] = {}
-            self._data["voice_days"][uid][today] = self._data["voice_days"][uid].get(today, 0) + duration
+            start = self._voice_sessions.pop(user_id, None)
+            if start is None:
+                return
+            end = time.time()
+            duration = int(end - start)
+            if duration < 5:
+                return
+            uid = str(user_id)
+            cursor = start
+            while cursor < end:
+                cursor_dt = datetime.datetime.fromtimestamp(cursor, DE_TZ)
+                nxt = datetime.datetime.combine(
+                    cursor_dt.date() + datetime.timedelta(days=1),
+                    datetime.time.min,
+                    tzinfo=DE_TZ,
+                ).timestamp()
+                chunk_end = min(end, nxt)
+                secs = int(chunk_end - cursor)
+                if secs > 0:
+                    day = str(cursor_dt.date())
+                    self._data["voice_time"][uid] = self._data["voice_time"].get(uid, 0) + secs
+                    if uid not in self._data["voice_days"]:
+                        self._data["voice_days"][uid] = {}
+                    self._data["voice_days"][uid][day] = self._data["voice_days"][uid].get(day, 0) + secs
+                cursor = chunk_end
             m = self._data["messages"]
             if uid not in m:
                 m[uid] = {"total": 0, "username": username, "daily": {}}
             m[uid]["username"] = username
-            self._save()
+            self._save(force=True)
 
     def get_voice_leaderboard(self, limit: int = 10) -> list:
         with self._lock:
@@ -764,23 +806,71 @@ else:
 #                   DATENMANAGEMENT
 # ══════════════════════════════════════════════════════════
 
-def load_data() -> dict:
+_data_lock = threading.Lock()
+
+
+def _atomic_write_json(path: str, payload: dict, indent: int = 4) -> None:
+    directory = os.path.dirname(os.path.abspath(path)) or "."
+    fd, tmp = tempfile.mkstemp(prefix=".tmp-", suffix=".json", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=indent, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def _load_data_unlocked() -> dict:
     try:
         with open(DATA_FILE, 'r', encoding='utf-8') as f:
             data = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
         data = {}
+    if not isinstance(data, dict):
+        data = {}
     data.setdefault("users", {})
     data.setdefault("streams", {})
+    data.setdefault("message_counts", {})
     return data
+
+
+def load_data() -> dict:
+    with _data_lock:
+        return _load_data_unlocked()
 
 
 def save_data(data: dict) -> None:
     try:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+        with _data_lock:
+            _atomic_write_json(DATA_FILE, data)
     except Exception as e:
         print(f"❌ Fehler beim Speichern: {e}")
+
+
+def today_berlin() -> datetime.date:
+    return datetime.datetime.now(DE_TZ).date()
+
+
+def is_real_stream_day(data: dict, date_str: str) -> bool:
+    lst = data.get("streams", {}).get(date_str)
+    return isinstance(lst, list) and len(lst) > 0
+
+
+def user_was_present(data: dict, uid: str, date_str: str) -> bool:
+    uid_s = str(uid)
+    lst = data.get("streams", {}).get(date_str) or []
+    if uid_s in lst or uid in lst:
+        return True
+    try:
+        return is_user_absent(uid_s, date_str)
+    except Exception:
+        return False
 
 
 # ══════════════════════════════════════════════════════════
@@ -974,7 +1064,7 @@ async def cmd_balance(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
-@d_bot.tree.command(name="a", description="💰 Hole dir deine täglichen Coins ab")
+@d_bot.tree.command(name="daily", description="💰 Hole dir deine täglichen Coins ab")
 @is_gambling_channel()
 async def cmd_daily(interaction: discord.Interaction):
     uid = str(interaction.user.id)
@@ -3944,8 +4034,7 @@ def load_bank() -> dict:
 
 def save_bank(bank: dict) -> None:
     try:
-        with open(GAMBLING_BANK_FILE, 'w', encoding='utf-8') as f:
-            json.dump(bank, f, indent=4, ensure_ascii=False)
+        _atomic_write_json(GAMBLING_BANK_FILE, bank)
     except Exception as e:
         print(f"❌ Fehler beim Speichern der Bank: {e}")
 
@@ -3991,7 +4080,7 @@ def make_streak_calendar(
 ) -> str:
     cal = calendar.Calendar(firstweekday=0)
     days = cal.itermonthdays(year, month)
-    today_str = str(datetime.date.today())
+    today_str = str(today_berlin())
     lines = ["`Mo Di Mi Do Fr Sa So`"]
     week = []
     for day in days:
@@ -3999,17 +4088,11 @@ def make_streak_calendar(
             week.append("  ")
         else:
             date_str = f"{year}-{month:02d}-{day:02d}"
-            if (
-                date_str in data["streams"]
-                and uid in data["streams"][date_str]
-            ):
+            if is_real_stream_day(data, date_str) and user_was_present(data, uid, date_str):
                 week.append("✅")
             elif date_str == today_str:
                 week.append("🔵")
-            elif (
-                date_str < today_str
-                and date_str in data["streams"]
-            ):
+            elif date_str < today_str and is_real_stream_day(data, date_str):
                 week.append("❌")
             elif date_str > today_str:
                 week.append("⬜")
@@ -4028,7 +4111,7 @@ def make_streak_calendar(
 def get_month_stats(
     data: dict, uid: str, year: int, month: int
 ) -> dict:
-    today = datetime.date.today()
+    today = today_berlin()
     days_in_month = calendar.monthrange(year, month)[1]
     stream_days = 0
     present_days = 0
@@ -4038,11 +4121,9 @@ def get_month_stats(
         date_obj = datetime.date(year, month, day)
         if date_obj > today:
             break
-        if date_str in data["streams"]:
+        if is_real_stream_day(data, date_str):
             stream_days += 1
-            # Vergleich: uid kann String oder in Liste (als String) sein
-            stream_list = data["streams"][date_str]
-            if uid in stream_list or str(uid) in stream_list:
+            if user_was_present(data, uid, date_str):
                 present_days += 1
             else:
                 absent_days += 1
@@ -4055,27 +4136,30 @@ def get_month_stats(
 
 def get_current_streak(data: dict, uid: str) -> int:
     uid_s = str(uid)
-    sorted_dates = sorted(data["streams"].keys(), reverse=True)
+    today = str(today_berlin())
+    sorted_dates = sorted(
+        (d for d in data["streams"] if is_real_stream_day(data, d)),
+        reverse=True,
+    )
     streak = 0
     for date_str in sorted_dates:
-        stream_list = data["streams"][date_str]
-        if uid_s in stream_list or uid in stream_list:
+        present = user_was_present(data, uid_s, date_str)
+        if date_str == today and not present:
+            continue
+        if present:
             streak += 1
         else:
-            # Streak nur brechen wenn es ein echter Stream-Tag war
-            # (nicht bei Tagen ohne Stream)
             break
     return streak
 
 
 def get_longest_streak(data: dict, uid: str) -> int:
     uid_s = str(uid)
-    sorted_dates = sorted(data["streams"].keys())
+    sorted_dates = sorted(d for d in data["streams"] if is_real_stream_day(data, d))
     longest = 0
     current = 0
     for date_str in sorted_dates:
-        stream_list = data["streams"][date_str]
-        if uid_s in stream_list or uid in stream_list:
+        if user_was_present(data, uid_s, date_str):
             current += 1
             longest = max(longest, current)
         else:
@@ -4114,16 +4198,15 @@ def parse_time(time_str: str) -> int | None:
 
 
 def get_user_compare_stats(data: dict, uid: str) -> dict:
-    total_days = len(data["streams"])
-    present = sum(
-        1 for d in data["streams"] if uid in data["streams"][d]
-    )
+    real = [d for d in data["streams"] if is_real_stream_day(data, d)]
+    total_days = len(real)
+    present = sum(1 for d in real if user_was_present(data, uid, d))
     absent = total_days - present
     pct = (present / total_days * 100) if total_days > 0 else 0
     current_streak = get_current_streak(data, uid)
     longest_streak = get_longest_streak(data, uid)
     all_counts = {
-        u: sum(1 for d in data["streams"] if u in data["streams"][d])
+        u: sum(1 for d in real if user_was_present(data, u, d))
         for u in data["users"]
     }
     sorted_users = sorted(
@@ -4134,13 +4217,13 @@ def get_user_compare_stats(data: dict, uid: str) -> dict:
         len(sorted_users),
     )
     last_seen = "Noch nie"
-    for date_str in sorted(data["streams"].keys(), reverse=True):
-        if uid in data["streams"][date_str]:
+    for date_str in sorted(real, reverse=True):
+        if user_was_present(data, uid, date_str):
             last_seen = date_str
             break
     first_seen = "Unbekannt"
-    for date_str in sorted(data["streams"].keys()):
-        if uid in data["streams"][date_str]:
+    for date_str in sorted(real):
+        if user_was_present(data, uid, date_str):
             first_seen = date_str
             break
     grade, grade_emoji, grade_color = get_activity_grade(pct)
@@ -4227,7 +4310,7 @@ def get_year_message_stats(data: dict, uid: str, year: int) -> dict:
 
 def get_month_activity_stats(data: dict, uid: str, year: int, month: int) -> dict:
     """Komplette Aktivitäts-Statistik für einen Monat."""
-    today = datetime.date.today()
+    today = today_berlin()
     days_in_month = calendar.monthrange(year, month)[1]
     stream_days = 0
     present_days = 0
@@ -4238,9 +4321,9 @@ def get_month_activity_stats(data: dict, uid: str, year: int, month: int) -> dic
         date_obj = datetime.date(year, month, day)
         if date_obj > today:
             break
-        if date_str in data["streams"]:
+        if is_real_stream_day(data, date_str):
             stream_days += 1
-            if uid in data["streams"][date_str]:
+            if user_was_present(data, uid, date_str):
                 present_days += 1
             else:
                 absent_days += 1
@@ -10954,189 +11037,36 @@ class TwitchBot(t_commands.Bot):
         # Nur loggen wenn Debug nötig (reduziert Spam)
         # print(f"💬 [Twitch] {message.author.name}: {message.content}")
 
-        data = load_data()
-        today = str(datetime.date.today())
-        now_hour = datetime.datetime.now(datetime.timezone.utc).hour
-        changed = False
+        now_de = datetime.datetime.now(DE_TZ)
+        today = str(now_de.date())
+        now_hour = now_de.hour
+        live_now = bool(globals().get("_stream_was_live"))
 
-        for discord_id, info in data["users"].items():
-            if info.get("twitch_name", "").lower() == chatter:
-                # ── Anwesenheits-Tracking ──────────────────────────
-                # Stelle sicher dass der Stream-Tag existiert
-                if today not in data["streams"]:
-                    data["streams"][today] = []
-
-                # discord_id ist ein String (JSON-Key), Vergleich muss konsistent sein
-                if discord_id not in data["streams"][today]:
-                    data["streams"][today].append(discord_id)
-                    print(f"  ⭐ [Twitch] {message.author.name} → erfasst für {today}")
+        if live_now:
+            data = load_data()
+            changed = False
+            for discord_id, info in data["users"].items():
+                if info.get("twitch_name", "").lower() == chatter:
+                    if today not in data["streams"]:
+                        break
+                    if discord_id not in data["streams"][today]:
+                        data["streams"][today].append(discord_id)
+                        print(f"  ⭐ [Twitch] {message.author.name} → erfasst für {today}")
+                        changed = True
+                    data.setdefault("message_counts", {})
+                    data["message_counts"].setdefault(today, {})
+                    data["message_counts"][today].setdefault(discord_id, {"count": 0, "hours": {}})
+                    data["message_counts"][today][discord_id]["count"] += 1
+                    hour_key = str(now_hour)
+                    data["message_counts"][today][discord_id]["hours"][hour_key] = (
+                        data["message_counts"][today][discord_id]["hours"].get(hour_key, 0) + 1
+                    )
                     changed = True
-
-                # ── Nachrichten-Tracking ───────────────────────────
-                data.setdefault("message_counts", {})
-                data["message_counts"].setdefault(today, {})
-                data["message_counts"][today].setdefault(discord_id, {"count": 0, "hours": {}})
-
-                data["message_counts"][today][discord_id]["count"] += 1
-                hour_key = str(now_hour)
-                data["message_counts"][today][discord_id]["hours"][hour_key] = (
-                    data["message_counts"][today][discord_id]["hours"].get(hour_key, 0) + 1
-                )
-                changed = True
-
-                # Dashboard-Tracking: Nachricht im Discord-Stats-System
-                try:
-                    stats_tracker.add_message(int(discord_id), info.get("display_name", message.author.name))
-                except Exception:
-                    pass
-
-                break
-
-        if changed:
-            save_data(data)
+                    break
+            if changed:
+                save_data(data)
 
         await self.handle_commands(message)
-
-# ══════════════════════════════════════════════════════════
-#        TWITCH API – REWARDS & LIVE CHECK
-# ══════════════════════════════════════════════════════════
-
-_twitch_app_token: str | None = None
-_twitch_app_token_expires: float = 0
-
-
-async def get_twitch_app_token() -> str | None:
-    """Holt einen App-Access-Token von Twitch."""
-    global _twitch_app_token, _twitch_app_token_expires
-
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-    if _twitch_app_token and now < _twitch_app_token_expires:
-        return _twitch_app_token
-
-    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
-        return None
-
-    try:
-        url = "https://id.twitch.tv/oauth2/token"
-        params = {
-            "client_id": TWITCH_CLIENT_ID,
-            "client_secret": TWITCH_CLIENT_SECRET,
-            "grant_type": "client_credentials",
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.post(url, params=params) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    _twitch_app_token = data["access_token"]
-                    _twitch_app_token_expires = now + data.get("expires_in", 3600) - 60
-                    return _twitch_app_token
-    except Exception as e:
-        print(f"❌ Twitch App-Token Fehler: {e}")
-
-    return None
-
-
-async def check_streamer_live() -> bool:
-    """Prüft ob der Streamer gerade live ist."""
-    if not STREAMER_CHANNEL:
-        return False
-
-    token = await get_twitch_app_token()
-    if not token:
-        return False
-
-    try:
-        url = f"https://api.twitch.tv/helix/streams?user_login={STREAMER_CHANNEL}"
-        headers = {
-            "Client-ID": TWITCH_CLIENT_ID,
-            "Authorization": f"Bearer {token}",
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    return len(data.get("data", [])) > 0
-    except Exception as e:
-        print(f"❌ Live-Check Fehler: {e}")
-
-    return False
-
-
-async def fetch_channel_rewards() -> list[dict]:
-    """Holt alle Kanalpunkt-Belohnungen des Streamers."""
-    if not STREAMER_USER_ID or not STREAMER_OAUTH_TOKEN:
-        print("⚠️ STREAMER_USER_ID oder STREAMER_OAUTH_TOKEN fehlt!")
-        return []
-
-    try:
-        url = (
-            f"https://api.twitch.tv/helix/channel_points/custom_rewards"
-            f"?broadcaster_id={STREAMER_USER_ID}"
-        )
-        headers = {
-            "Client-ID": TWITCH_CLIENT_ID,
-            "Authorization": f"Bearer {STREAMER_OAUTH_TOKEN}",
-        }
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    rewards = []
-                    for r in data.get("data", []):
-                        if not r.get("is_enabled", False):
-                            continue
-                        rewards.append({
-                            "id": r["id"],
-                            "title": r["title"],
-                            "cost": r["cost"],
-                            "prompt": r.get("prompt", ""),
-                            "is_paused": r.get("is_paused", False),
-                            "is_in_stock": r.get("is_in_stock", True),
-                            "color": r.get("background_color", "#9146FF"),
-                            "image": (
-                                r.get("image", {}).get("url_4x", "")
-                                if r.get("image") else
-                                r.get("default_image", {}).get("url_4x", "")
-                            ),
-                        })
-                    print(f"✅ {len(rewards)} Twitch-Rewards geladen")
-                    return rewards
-                else:
-                    error_text = await resp.text()
-                    print(f"❌ Rewards API Fehler ({resp.status}): {error_text}")
-
-                    # Token abgelaufen
-                    if resp.status == 401:
-                        print(
-                            "⚠️ STREAMER_OAUTH_TOKEN ist abgelaufen oder ungültig!\n"
-                            "   Generiere einen neuen Token und trage ihn in die .env ein."
-                        )
-
-    except Exception as e:
-        print(f"❌ Fehler beim Laden der Rewards: {e}")
-
-    return []
-
-# Cache für Rewards (wird alle 5 Minuten aktualisiert)
-_rewards_cache: list[dict] = []
-_rewards_cache_time: float = 0
-REWARDS_CACHE_DURATION = 300  # 5 Minuten
-
-
-async def get_cached_rewards() -> list[dict]:
-    """Gibt gecachte Rewards zurück, aktualisiert bei Bedarf."""
-    global _rewards_cache, _rewards_cache_time
-
-    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
-    if _rewards_cache and now - _rewards_cache_time < REWARDS_CACHE_DURATION:
-        return _rewards_cache
-
-    rewards = await fetch_channel_rewards()
-    if rewards:
-        _rewards_cache = rewards
-        _rewards_cache_time = now
-
-    return _rewards_cache
 
     # ══════════════════════════════════════════════════════
     #           TWITCH MOD EVENTS
@@ -11315,10 +11245,10 @@ async def get_cached_rewards() -> list[dict]:
         chatter = ctx.author.name.lower()
         for uid, info in data["users"].items():
             if info.get("twitch_name", "").lower() == chatter:
-                total = len(data["streams"])
+                total = sum(1 for d in data["streams"] if is_real_stream_day(data, d))
                 present = sum(
                     1 for d in data["streams"]
-                    if uid in data["streams"][d]
+                    if is_real_stream_day(data, d) and user_was_present(data, uid, d)
                 )
                 pct = (present / total * 100) if total > 0 else 0
                 await ctx.send(
@@ -11328,10 +11258,154 @@ async def get_cached_rewards() -> list[dict]:
                 return
         await ctx.send(f"❌ {ctx.author.name} ist nicht registriert.")
 
+# ══════════════════════════════════════════════════════════
+#        TWITCH API – REWARDS & LIVE CHECK
+# ══════════════════════════════════════════════════════════
+
+_twitch_app_token: str | None = None
+_twitch_app_token_expires: float = 0
+
+
+async def get_twitch_app_token() -> str | None:
+    """Holt einen App-Access-Token von Twitch."""
+    global _twitch_app_token, _twitch_app_token_expires
+
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    if _twitch_app_token and now < _twitch_app_token_expires:
+        return _twitch_app_token
+
+    if not TWITCH_CLIENT_ID or not TWITCH_CLIENT_SECRET:
+        return None
+
+    try:
+        url = "https://id.twitch.tv/oauth2/token"
+        params = {
+            "client_id": TWITCH_CLIENT_ID,
+            "client_secret": TWITCH_CLIENT_SECRET,
+            "grant_type": "client_credentials",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.post(url, params=params) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    _twitch_app_token = data["access_token"]
+                    _twitch_app_token_expires = now + data.get("expires_in", 3600) - 60
+                    return _twitch_app_token
+    except Exception as e:
+        print(f"❌ Twitch App-Token Fehler: {e}")
+
+    return None
+
+
+async def check_streamer_live() -> bool:
+    """Prüft ob der Streamer gerade live ist."""
+    if not STREAMER_CHANNEL:
+        return False
+
+    token = await get_twitch_app_token()
+    if not token:
+        return False
+
+    try:
+        url = f"https://api.twitch.tv/helix/streams?user_login={STREAMER_CHANNEL}"
+        headers = {
+            "Client-ID": TWITCH_CLIENT_ID,
+            "Authorization": f"Bearer {token}",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    return len(data.get("data", [])) > 0
+    except Exception as e:
+        print(f"❌ Live-Check Fehler: {e}")
+
+    return False
+
+
+async def fetch_channel_rewards() -> list[dict]:
+    """Holt alle Kanalpunkt-Belohnungen des Streamers."""
+    if not STREAMER_USER_ID or not STREAMER_OAUTH_TOKEN:
+        print("⚠️ STREAMER_USER_ID oder STREAMER_OAUTH_TOKEN fehlt!")
+        return []
+
+    try:
+        url = (
+            f"https://api.twitch.tv/helix/channel_points/custom_rewards"
+            f"?broadcaster_id={STREAMER_USER_ID}"
+        )
+        headers = {
+            "Client-ID": TWITCH_CLIENT_ID,
+            "Authorization": f"Bearer {STREAMER_OAUTH_TOKEN}",
+        }
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    rewards = []
+                    for r in data.get("data", []):
+                        if not r.get("is_enabled", False):
+                            continue
+                        rewards.append({
+                            "id": r["id"],
+                            "title": r["title"],
+                            "cost": r["cost"],
+                            "prompt": r.get("prompt", ""),
+                            "is_paused": r.get("is_paused", False),
+                            "is_in_stock": r.get("is_in_stock", True),
+                            "color": r.get("background_color", "#9146FF"),
+                            "image": (
+                                r.get("image", {}).get("url_4x", "")
+                                if r.get("image") else
+                                r.get("default_image", {}).get("url_4x", "")
+                            ),
+                        })
+                    print(f"✅ {len(rewards)} Twitch-Rewards geladen")
+                    return rewards
+                else:
+                    error_text = await resp.text()
+                    print(f"❌ Rewards API Fehler ({resp.status}): {error_text}")
+
+                    # Token abgelaufen
+                    if resp.status == 401:
+                        print(
+                            "⚠️ STREAMER_OAUTH_TOKEN ist abgelaufen oder ungültig!\n"
+                            "   Generiere einen neuen Token und trage ihn in die .env ein."
+                        )
+
+    except Exception as e:
+        print(f"❌ Fehler beim Laden der Rewards: {e}")
+
+    return []
+
+# Cache für Rewards (wird alle 5 Minuten aktualisiert)
+_rewards_cache: list[dict] = []
+_rewards_cache_time: float = 0
+REWARDS_CACHE_DURATION = 300  # 5 Minuten
+
+
+async def get_cached_rewards() -> list[dict]:
+    """Gibt gecachte Rewards zurück, aktualisiert bei Bedarf."""
+    global _rewards_cache, _rewards_cache_time
+
+    now = datetime.datetime.now(datetime.timezone.utc).timestamp()
+    if _rewards_cache and now - _rewards_cache_time < REWARDS_CACHE_DURATION:
+        return _rewards_cache
+
+    rewards = await fetch_channel_rewards()
+    if rewards:
+        _rewards_cache = rewards
+        _rewards_cache_time = now
+
+    return _rewards_cache
+
 
 # ══════════════════════════════════════════════════════════
 #         REVIEW SCHEDULER (Monatlich + Jährlich)
 # ══════════════════════════════════════════════════════════
+
+_review_sent: set[str] = set()
+
 
 @tasks.loop(minutes=1)
 async def review_scheduler():
@@ -11339,35 +11413,31 @@ async def review_scheduler():
     if not REVIEW_CHANNEL_ID:
         return
 
-    # Deutschland-Zeit (CET/CEST)
-    try:
-        import zoneinfo
-        de_tz = zoneinfo.ZoneInfo("Europe/Berlin")
-    except ImportError:
-        de_tz = datetime.timezone(datetime.timedelta(hours=1))
-
-    now_de = datetime.datetime.now(de_tz)
+    now_de = datetime.datetime.now(DE_TZ)
     today = now_de.date()
     last_day = calendar.monthrange(today.year, today.month)[1]
 
-    # Monatsbericht: Letzter Tag des Monats um 22:00 DE-Zeit
     if today.day == last_day and now_de.hour == 22 and now_de.minute == 0:
-        try:
-            channel = d_bot.get_channel(REVIEW_CHANNEL_ID)
-            if channel:
-                await send_monthly_review(channel, channel.guild, today.year, today.month)
-        except Exception as e:
-            print(f"❌ [Review] Monatsbericht Fehler: {e}")
+        key = f"m-{today.year}-{today.month}"
+        if key not in _review_sent:
+            try:
+                channel = d_bot.get_channel(REVIEW_CHANNEL_ID)
+                if channel:
+                    await send_monthly_review(channel, channel.guild, today.year, today.month)
+                    _review_sent.add(key)
+            except Exception as e:
+                print(f"❌ [Review] Monatsbericht Fehler: {e}")
 
-    # Jahresbericht: 1. Dezember um 22:00 DE-Zeit
     if today.month == 12 and today.day == 1 and now_de.hour == 22 and now_de.minute == 0:
-        try:
-            channel = d_bot.get_channel(REVIEW_CHANNEL_ID)
-            if channel:
-                # Jahresbericht für das aktuelle Jahr
-                await send_yearly_review(channel, channel.guild, today.year)
-        except Exception as e:
-            print(f"❌ [Review] Jahresbericht Fehler: {e}")
+        key = f"y-{today.year}"
+        if key not in _review_sent:
+            try:
+                channel = d_bot.get_channel(REVIEW_CHANNEL_ID)
+                if channel:
+                    await send_yearly_review(channel, channel.guild, today.year)
+                    _review_sent.add(key)
+            except Exception as e:
+                print(f"❌ [Review] Jahresbericht Fehler: {e}")
 
 
 @review_scheduler.before_loop
@@ -11395,10 +11465,9 @@ async def stream_live_tracker():
     is_live = await check_streamer_live()
 
     if is_live:
-        today = str(datetime.date.today())
+        today = str(today_berlin())
         data = load_data()
 
-        # Tag in streams eintragen falls noch nicht vorhanden
         if today not in data["streams"]:
             data["streams"][today] = []
             save_data(data)
@@ -11683,6 +11752,15 @@ async def on_ready():
 
     print("═══════════════════════════════════")
     print("")
+
+    try:
+        for guild in d_bot.guilds:
+            for vc in guild.voice_channels:
+                for member in vc.members:
+                    if not member.bot:
+                        dashboard_state.voice_join(member.id, member.display_name, vc.name)
+    except Exception as e:
+        print(f"⚠️ [Voice] on_ready Sessions: {e}")
 
     # ── Temp Voice Channels nach Neustart wiederherstellen ──
     if TEMP_VOICE_CHANNEL_ID:
@@ -11997,13 +12075,16 @@ async def on_voice_state_update(
 
         await asyncio.sleep(1)
 
-        voice_channel = member.guild.get_channel(channel_id)
+        try:
+            voice_channel = await member.guild.fetch_channel(channel_id)
+        except Exception:
+            voice_channel = member.guild.get_channel(channel_id)
         if voice_channel is None:
             temp_voice_channels.pop(channel_id, None)
             return
 
-        # Kanal leer → löschen
-        if len(voice_channel.members) == 0:
+        # Kanal leer → löschen (Mitglieder nach Sleep neu prüfen)
+        if len(getattr(voice_channel, "members", []) or []) == 0:
             clear_owner_recovery(channel_id)
             await delete_temp_voice_channel(channel_id, member.guild)
             dashboard_state.push_event_sync("vc_deleted", {"channel_id": channel_id})
@@ -12110,25 +12191,6 @@ async def on_member_join(member: discord.Member):
                     "Verdächtiger Username (viele Zahlen/Sonderzeichen)"
                 )
         vpn_detected = False
-        if PROXYCHECK_API_KEY:
-            if account_age_hours < 24:
-                vpn_detected = True
-                reasons.append(
-                    "🔴 Hohes Risiko: Extrem neuer Account "
-                    "(möglicher VPN/Proxy-User)"
-                )
-                if not alarm_triggered:
-                    alarm_triggered = True
-                    embed_color = discord.Color.red()
-                    alarm_level = "🚨 HOHES RISIKO"
-            elif account_age_days < 3 and has_no_avatar:
-                reasons.append(
-                    "🟠 Mittleres Risiko: Neuer Account ohne Profilbild"
-                )
-                if not alarm_triggered:
-                    alarm_triggered = True
-                    embed_color = discord.Color.orange()
-                    alarm_level = "⚠️ VERDÄCHTIG"
         if alarm_triggered:
             embed = discord.Embed(
                 title=f"{alarm_level} – Neues Mitglied",
@@ -12287,7 +12349,7 @@ async def on_message_delete(message: discord.Message):
     """Loggt gelöschte Nachrichten in den MESSAGE_LOG_CHANNEL."""
     if not MESSAGE_LOG_CHANNEL_ID:
         return
-    if message.author.bot:
+    if message.author is None or message.author.bot:
         return
     if not message.content and not message.attachments:
         return
@@ -13332,17 +13394,20 @@ async def cmd_status(interaction: discord.Interaction):
     today = str(datetime.date.today())
     today_count = len(data["streams"].get(today, []))
 
-    # Nächsten Review berechnen
     next_review = "Deaktiviert"
     if REVIEW_CHANNEL_ID:
-        next_sunday = datetime.date.today()
-        while next_sunday.weekday() != 6:
-            next_sunday += datetime.timedelta(days=1)
-        next_review_dt = datetime.datetime(
-            next_sunday.year, next_sunday.month, next_sunday.day,
-            20, 0, 0, tzinfo=datetime.timezone.utc
-        )
-        next_review = f"<t:{int(next_review_dt.timestamp())}:R>"
+        now_de = datetime.datetime.now(DE_TZ)
+        today = now_de.date()
+        last_day = calendar.monthrange(today.year, today.month)[1]
+        nxt = datetime.datetime(today.year, today.month, last_day, 22, 0, tzinfo=DE_TZ)
+        if now_de >= nxt:
+            if today.month == 12:
+                nxt = datetime.datetime(today.year + 1, 1, 31, 22, 0, tzinfo=DE_TZ)
+            else:
+                nm = today.month + 1
+                ld = calendar.monthrange(today.year, nm)[1]
+                nxt = datetime.datetime(today.year, nm, ld, 22, 0, tzinfo=DE_TZ)
+        next_review = f"<t:{int(nxt.timestamp())}:R>"
 
     ### MUSIC MODULE START ###
     active_music = sum(
@@ -13372,7 +13437,7 @@ async def cmd_status(interaction: discord.Interaction):
             f"{'✅ Aktiv' if PROXYCHECK_API_KEY else '❌ Deaktiviert'}\n"
             f"Temp Voice ──── "
             f"{'✅ Aktiv (' + str(len(temp_voice_channels)) + ' Kanäle)' if TEMP_VOICE_CHANNEL_ID else '❌ Deaktiviert'}\n"
-            f"Weekly Review ─ "
+            f"Monthly Review ─ "
             f"{'✅ Aktiv' if REVIEW_CHANNEL_ID else '❌ Deaktiviert'}\n"
             ### MUSIC MODULE START ###
             f"Musik-Modul ─── "
@@ -13513,10 +13578,10 @@ async def cmd_aihelp(interaction: discord.Interaction):
         )
     if REVIEW_CHANNEL_ID:
         embed.add_field(
-            name="📅 Weekly Review",
+            name="📅 Monthly Review",
             value=(
-                "Jeden **Sonntag um 20:00 UTC** wird automatisch\n"
-                "ein Wochen-Aktivitätsbericht gesendet.\n\n"
+                "Am **letzten Tag jedes Monats um 22:00 Europe/Berlin**\n"
+                "wird ein Monatsbericht gesendet. Jahresbericht am **1. Dezember**.\n\n"
                 "`/weeklyreview` — Manuell auslösen (nur Admins)"
             ),
             inline=False,
@@ -14150,13 +14215,6 @@ async def cmd_absent(
 
     add_absence(uid, date_str, grund)
 
-    # Streak-Schutz: User als "anwesend" markieren für diesen Tag
-    if date_str not in data["streams"]:
-        data["streams"][date_str] = []
-    if uid not in data["streams"][date_str]:
-        data["streams"][date_str].append(uid)
-        save_data(data)
-
     day_name = WEEKDAY_SHORT[parsed_date.weekday()]
     embed = discord.Embed(
         title="📋 Abwesenheit eingetragen",
@@ -14164,7 +14222,7 @@ async def cmd_absent(
             f"Du bist für **{parsed_date.strftime('%d.%m.%Y')}** ({day_name}) abgemeldet.\n\n"
             f"📝 **Grund:** {grund}\n"
             f"✅ **Streak wird geschützt!**\n\n"
-            f"*Du wirst als anwesend markiert obwohl du nicht im Chat warst.*"
+            f"*Deine Streak bleibt geschützt, ohne einen Fake-Stream-Tag anzulegen.*"
         ),
         color=COLOR_ABSENCE,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
@@ -16059,7 +16117,36 @@ def _favicon():
     svg = '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32"><rect width="32" height="32" rx="8" fill="#6366f1"/><path d="M8 12h16M8 16h16M8 20h10" stroke="#fff" stroke-width="2.5" stroke-linecap="round"/></svg>'
     return _Response(svg, mimetype="image/svg+xml")
 
+@_flask_app.after_request
+def _public_headers(resp):
+    resp.headers.pop("X-Frame-Options", None)
+    return resp
+
 @_flask_app.route("/")
+def _public_hub():
+    try:
+        from dashboard.public_data import build_public_payload
+        payload = build_public_payload(
+            guild=_fetch_guild() or {},
+            now_playing=dashboard_state.now_playing,
+        )
+    except Exception as e:
+        print(f"[Public] payload error: {e}")
+        payload = {"guild": {"name": "ByGorgii", "icon_url": "", "member_count": 0, "online_count": 0},
+                   "kpis": {}, "roster": [], "weeks": [], "monthly": [],
+                   "daily_messages": [], "daily_voice": [], "msg_leaderboard": [],
+                   "voice_leaderboard": [], "recent_joins": [], "live": False,
+                   "today": str(today_berlin()), "year": today_berlin().year,
+                   "month_name": "", "generated_at": "", "streamer": STREAMER_CHANNEL,
+                   "invite": os.getenv("DISCORD_INVITE_URL", "")}
+    return _render("public.html", payload=payload)
+
+@_flask_app.route("/api/public/hub")
+def _api_public_hub():
+    from dashboard.public_data import build_public_payload
+    return _jsonify(build_public_payload(guild=_fetch_guild() or {}, now_playing=dashboard_state.now_playing))
+
+@_flask_app.route("/admin")
 @_require_admin
 def _index():
     s = _load_stats(); ch = _fetch_channels()
@@ -16379,6 +16466,10 @@ async def main():
         print(f"❌ Kritischer Fehler: {e}")
     finally:
         print("\n🔄 Fahre herunter...")
+        try:
+            stats_tracker.flush()
+        except Exception:
+            pass
         if review_scheduler.is_running():
             review_scheduler.cancel()
         if stream_live_tracker.is_running():

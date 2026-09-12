@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ payload.guild.name }} — Activity Hub</title>
+  <meta name="description" content="Live Activity Hub für Discord, Twitch-Streams, Voice und Mod-Tracking.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=Outfit:wght@300;400;500;600;700;800&family=Syne:wght@700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/public.css') }}">
+</head>
+<body>
+  <div class="aurora"></div>
+  <div class="noise"></div>
+  <div class="wrap">
+    <nav class="top">
+      <a class="brand" href="/">
+        {% if payload.guild.icon_url %}
+          <img src="{{ payload.guild.icon_url }}" alt="">
+        {% else %}
+          <div class="mark">BG</div>
+        {% endif %}
+        <span>{{ payload.guild.name }}</span>
+      </a>
+      <div class="nav-links">
+        <a href="#pulse">Pulse</a>
+        <a href="#mods">Mods</a>
+        <a href="#streams">Streams</a>
+        <a href="#voice">Voice</a>
+      </div>
+      <div class="nav-cta">
+        {% if payload.invite %}
+          <a class="btn primary" href="{{ payload.invite }}" target="_blank" rel="noopener">Discord beitreten</a>
+        {% endif %}
+        {% if payload.streamer %}
+          <a class="btn" href="https://twitch.tv/{{ payload.streamer }}" target="_blank" rel="noopener">Twitch</a>
+        {% endif %}
+        <a class="btn" href="/admin">Admin</a>
+      </div>
+    </nav>
+
+    <header class="hero">
+      <div class="hero-bg" style="background-image:url('{{ url_for('static', filename='img/hero.jpg') }}')"></div>
+      <div class="hero-copy">
+        <div class="kicker">
+          <span class="pulse {% if not payload.live %}off{% endif %}"></span>
+          {% if payload.live %}LIVE SIGNAL{% else %}OFFLINE · ARCHIVE MODE{% endif %}
+          · {{ payload.today }}
+        </div>
+        <h1>Der Raum, in dem<br><em>Community atmet.</em></h1>
+        <p class="lede">
+          Öffentlicher Activity Hub für Discord, Twitch-Chat und Voice.
+          Jeder Stream-Tag, jede Anwesenheit, jede Streak — in Berlin-Zeit, ohne Phantom-Tage.
+        </p>
+        <div class="hero-actions">
+          <a class="btn primary" href="#mods">Leaderboard öffnen</a>
+          <a class="btn" href="#streams">Stream-Kalender</a>
+        </div>
+      </div>
+    </header>
+
+    <section class="section" id="pulse">
+      <h2>Server-Pulse</h2>
+      <p class="sub">Live-Zahlen aus Tracking — Discord-Chat, Voice und Twitch-Anwesenheit.</p>
+      <div class="kpis" id="kpis">
+        <article class="kpi"><div class="label">Mitglieder</div><div class="val" data-count="{{ payload.guild.member_count }}">{{ payload.guild.member_count }}</div><div class="hint">{{ payload.guild.online_count }} online</div></article>
+        <article class="kpi"><div class="label">Mods</div><div class="val" data-count="{{ payload.kpis.mods }}">{{ payload.kpis.mods }}</div><div class="hint">verknüpft</div></article>
+        <article class="kpi"><div class="label">Stream-Tage</div><div class="val" data-count="{{ payload.kpis.stream_days }}">{{ payload.kpis.stream_days }}</div><div class="hint">echte Lives</div></article>
+        <article class="kpi"><div class="label">Twitch-Msgs</div><div class="val" data-count="{{ payload.kpis.twitch_messages }}">{{ payload.kpis.twitch_messages }}</div><div class="hint">im Stream-Chat</div></article>
+        <article class="kpi"><div class="label">Discord-Msgs</div><div class="val" data-count="{{ payload.kpis.discord_messages }}">{{ payload.kpis.discord_messages }}</div><div class="hint">Server-Chat</div></article>
+        <article class="kpi"><div class="label">Voice</div><div class="val">{{ payload.kpis.voice_label }}</div><div class="hint">gesamt</div></article>
+      </div>
+    </section>
+
+    <section class="section" id="streams">
+      <div class="bento">
+        <article class="card">
+          <h3>16 Wochen Stream-Wärme</h3>
+          <div class="weeks" id="weeks"></div>
+          <div class="legend">
+            <span><i style="background:#7c6cff"></i>Stream</span>
+            <span><i style="background:rgba(255,255,255,.06)"></i>kein Stream</span>
+            <span>Mo → So von oben nach unten</span>
+          </div>
+        </article>
+        <article class="card">
+          <h3>Discord-Nachrichten · 14 Tage</h3>
+          <div class="chart" id="msg-chart"></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section" id="mods">
+      <h2>Mod-Aktivität</h2>
+      <p class="sub">Nur echte Stream-Tage zählen. Entschuldigte Absenzen schützen die Streak, erzeugen aber keine Fake-Streams.</p>
+      <article class="card" style="overflow:auto">
+        <table class="roster">
+          <thead>
+            <tr>
+              <th>#</th><th>Mod</th><th>Note</th><th>Quote</th><th>Streak</th><th>Twitch</th><th>Voice</th><th>{{ payload.month_name }}</th>
+            </tr>
+          </thead>
+          <tbody id="roster-body"></tbody>
+        </table>
+      </article>
+    </section>
+
+    <section class="section" id="voice">
+      <div class="bento">
+        <article class="card">
+          <h3>Voice-Zeit · 14 Tage</h3>
+          <div class="chart" id="voice-chart"></div>
+        </article>
+        <article class="card">
+          <h3>Voice-Leaderboard</h3>
+          <div class="lb" id="voice-lb"></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <h2>{{ payload.year }} in Monaten</h2>
+      <p class="sub">Wie oft wirklich gestreamt wurde — leere Kalendertage zählen nicht.</p>
+      <div class="monthgrid" id="months"></div>
+    </section>
+
+    <section class="section">
+      <div class="bento">
+        <article class="card">
+          <h3>Discord Chat-Leaderboard</h3>
+          <div class="lb" id="msg-lb"></div>
+        </article>
+        <article class="card">
+          <h3>Zuletzt beigetreten</h3>
+          <div class="lb" id="joins"></div>
+        </article>
+      </div>
+    </section>
+
+    <footer class="site">
+      <div>© {{ payload.year }} {{ payload.guild.name }} · Activity Hub · Europe/Berlin</div>
+      <div>
+        <a href="/nutzungsbedingungen">Nutzungsbedingungen</a>
+        · <a href="/datenschutz">Datenschutz</a>
+        · Stand <span id="stamp">{{ payload.generated_at }}</span>
+      </div>
+    </footer>
+  </div>
+
+  <div class="modal-bg" id="modal">
+    <div class="modal" id="modal-inner"></div>
+  </div>
+
+  <script>window.__HUB__ = {{ payload | tojson }};</script>
+  <script src="{{ url_for('static', filename='js/public.js') }}"></script>
+</body>
+</html>

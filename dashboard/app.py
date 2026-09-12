@@ -390,7 +390,33 @@ def favicon():
 #  ROUTES – SEITEN
 # ══════════════════════════════════════════════════════════════
 
+@app.after_request
+def _public_headers(resp):
+    resp.headers.pop("X-Frame-Options", None)
+    return resp
+
 @app.route("/")
+def public_hub():
+    from public_data import build_public_payload
+    payload = build_public_payload(guild=fetch_guild_info() or {}, now_playing=get_now_playing())
+    return render_template("public.html", payload=payload)
+
+@app.route("/api/public/hub")
+def api_public_hub():
+    from public_data import build_public_payload
+    return jsonify(build_public_payload(guild=fetch_guild_info() or {}, now_playing=get_now_playing()))
+
+@app.route("/nutzungsbedingungen")
+@app.route("/tos")
+def tos():
+    return render_template("tos.html", now=datetime.datetime.now())
+
+@app.route("/datenschutz")
+@app.route("/privacy")
+def privacy():
+    return render_template("privacy.html", now=datetime.datetime.now())
+
+@app.route("/admin")
 @require_admin
 def index():
     stats    = load_stats()
