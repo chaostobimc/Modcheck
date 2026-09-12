@@ -36,9 +36,14 @@
       </a>
 
       <div class="login-info">
-        <div class="login-info-label">OAuth Redirect (Raspberry Pi)</div>
+        <div class="login-info-label">Redirect URI für Discord</div>
         <div class="login-info-uri">{{ redirect_uri }}</div>
-        <div class="login-hint">Diese URL in Discord Developer Portal → OAuth2 → Redirects eintragen.</div>
+        <div class="login-hint">
+          Genau diese URL unter Discord Developer Portal → OAuth2 → Redirects eintragen.
+          Discord akzeptiert <strong>keine http://IP-Adresse</strong> (daher 127.0.0.1, nicht die Pi-LAN-IP).
+          Zum Anmelden die Login-Seite unter <code>http://127.0.0.1:{{ request.host.split(':')[-1] if ':' in request.host else '5000' }}/login</code>
+          öffnen (direkt auf dem Pi oder per SSH-Tunnel).
+        </div>
       </div>
 
       <div class="login-footer">

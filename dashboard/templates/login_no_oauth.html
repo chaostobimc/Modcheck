@@ -14,7 +14,7 @@
     <aside class="login-side">
       <div class="login-side-kicker">Setup</div>
       <h1>OAuth fehlt noch</h1>
-      <p>Client-ID und Secret aus dem Discord Developer Portal in die <code>.env</code> auf dem Pi legen. Redirect ist die LAN-IP, kein Tunnel.</p>
+      <p>Client-ID und Secret aus dem Discord Developer Portal in die <code>.env</code> legen. Redirect muss <code>http://127.0.0.1:…/auth/callback</code> sein — Discord lehnt LAN-IPs ab.</p>
     </aside>
     <div class="login-card" style="width:min(440px,100%)">
       <div class="login-title">.env</div>

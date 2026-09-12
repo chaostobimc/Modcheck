@@ -254,20 +254,40 @@ def _lan_ipv4() -> str:
         pass
     return "127.0.0.1"
 
-def _usable_redirect(uri: str) -> str:
-    u = (uri or "").strip()
-    low = u.lower()
+def _discord_ok_redirect(uri: str) -> str:
+    """Discord: http nur für localhost/127.0.0.1, sonst nur https. Keine LAN-IPs."""
+    from urllib.parse import urlparse
+    u = (uri or "").strip().strip("\"'").rstrip("/")
     if not u:
         return ""
+    low = u.lower()
     if any(x in low for x in ("ngrok", "loca.lt", "trycloudflare", "cloudflared")):
+        return ""
+    try:
+        p = urlparse(u)
+    except Exception:
+        return ""
+    if p.scheme not in ("http", "https") or not p.netloc or p.fragment:
+        return ""
+    host = (p.hostname or "").lower()
+    if p.scheme == "http" and host not in ("localhost", "127.0.0.1"):
+        return ""
+    if host in ("0.0.0.0",):
         return ""
     return u
 
 def get_redirect_uri() -> str:
-    env = _usable_redirect(_REDIRECT_URI_ENV)
+    env = _discord_ok_redirect(_REDIRECT_URI_ENV)
     if env:
         return env
-    return f"http://{_lan_ipv4()}:{DASHBOARD_PORT}/auth/callback"
+    try:
+        host = (request.host or "").split("%")[0]
+        hostname = host.split(":")[0].lower()
+        if hostname in ("localhost", "127.0.0.1"):
+            return f"http://{host}/auth/callback"
+    except Exception:
+        pass
+    return f"http://127.0.0.1:{DASHBOARD_PORT}/auth/callback"
 
 # ── Discord API ──────────────────────────────────────────────
 def _bh() -> dict:
