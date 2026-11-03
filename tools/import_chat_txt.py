@@ -4,9 +4,9 @@
 Komplett ohne Drittanbieter-Abhängigkeiten lauffähig (reines Standard-Python).
 
 Verwendung:
-    python3 tools/import_chat_txt.py pfad/zur/twitch_chat_user.txt
-    python3 tools/import_chat_txt.py *.txt
-    python3 tools/import_chat_txt.py datei.txt --discord-id 123456789012345678 --twitch-name user
+    python3 tools/import_chat_txt.py chat_export/*.txt
+    python3 tools/import_chat_txt.py datei.txt --discord-id 829299014083936276 --twitch-name chaostobi_ --display-name Chaos
+    python3 tools/import_chat_txt.py --reset ...
 """
 from __future__ import annotations
 
@@ -28,12 +28,20 @@ LINE_RE = re.compile(
 HEADER_USER_RE = re.compile(r"^User:\s*(.+)$", re.IGNORECASE)
 
 
-def _load_json(filepath: str) -> dict:
-    if os.path.exists(filepath):
-        with open(filepath, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    else:
-        data = {}
+def _empty_data() -> dict:
+    return {
+        "users": {},
+        "streams": {},
+        "stream_meta": {},
+        "message_counts": {},
+    }
+
+
+def _load_json(filepath: str, reset: bool = False) -> dict:
+    if reset or not os.path.exists(filepath):
+        return _empty_data()
+    with open(filepath, "r", encoding="utf-8") as f:
+        data = json.load(f)
     data.setdefault("users", {})
     data.setdefault("streams", {})
     data.setdefault("stream_meta", {})
@@ -42,11 +50,18 @@ def _load_json(filepath: str) -> dict:
 
 
 def _save_json_atomic(filepath: str, data: dict) -> None:
+    # Chronologische Sortierung der Datums-Keys für eine saubere data.json
+    sorted_data = {
+        "users": data.get("users", {}),
+        "streams": dict(sorted(data.get("streams", {}).items())),
+        "stream_meta": dict(sorted(data.get("stream_meta", {}).items())),
+        "message_counts": dict(sorted(data.get("message_counts", {}).items())),
+    }
     target_dir = os.path.dirname(os.path.abspath(filepath)) or "."
     fd, tmp_path = tempfile.mkstemp(dir=target_dir, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=4, ensure_ascii=False)
+            json.dump(sorted_data, f, indent=4, ensure_ascii=False)
         os.replace(tmp_path, filepath)
     except Exception:
         if os.path.exists(tmp_path):
@@ -59,13 +74,14 @@ def import_single_file(
     data: dict,
     forced_uid: str | None = None,
     forced_twitch: str | None = None,
+    forced_display: str | None = None,
 ) -> tuple[int, int]:
     """Liest eine exportierte .txt-Datei ein und aktualisiert data (streams + message_counts)."""
     with open(filepath, "r", encoding="utf-8") as f:
         lines = [ln.rstrip("\r\n") for ln in f]
 
     header_user = ""
-    parsed_rows: list[tuple[str, int, int, str]] = []
+    raw_rows: list[tuple[str, int, int, bool, str, str]] = []
 
     for ln in lines:
         if not header_user:
@@ -80,6 +96,9 @@ def import_single_file(
         day_iso = f"{m.group('year')}-{m.group('mon')}-{m.group('day')}"
         hh = int(m.group("hour"))
         mm = int(m.group("min"))
+        has_sec = m.group("sec") is not None
+        row_user = m.group("user").strip()
+        row_text = m.group("text").strip()
         try:
             datetime.date.fromisoformat(day_iso)
         except ValueError:
@@ -87,15 +106,29 @@ def import_single_file(
         if not (0 <= hh < 24 and 0 <= mm < 60):
             continue
         if not header_user:
-            header_user = m.group("user").strip().lower()
-        parsed_rows.append((day_iso, hh, mm, f"{hh:02d}:{mm:02d}"))
+            header_user = row_user.lower()
+
+        # Reine DOM-Header-Artefakte ("[Datum 00:00] user: user") ignorieren
+        if not has_sec and hh == 0 and mm == 0 and row_text.lower() == row_user.lower():
+            continue
+
+        raw_rows.append((day_iso, hh, mm, has_sec, f"{hh:02d}:{mm:02d}", row_user))
+
+    # Falls die Datei exakte GQL-Sekunden-Einträge enthält, DOM-Duplikate ohne Sekunden an GQL-Tagen herausfiltern
+    gql_days = {r[0] for r in raw_rows if r[3]}
+    has_any_gql = bool(gql_days)
+    parsed_rows: list[tuple[str, int, int, str]] = []
+    for day_iso, hh, mm, has_sec, hm_str, _ in raw_rows:
+        if not has_sec and has_any_gql and day_iso in gql_days:
+            continue
+        parsed_rows.append((day_iso, hh, mm, hm_str))
 
     if not parsed_rows:
         print(f"⚠️ Keine gültigen Chat-Zeilen in {filepath} gefunden.")
         return 0, 0
 
     twitch_login = (forced_twitch or header_user).strip().lower()
-    matched_uid = forced_uid
+    matched_uid = str(forced_uid).strip() if forced_uid else None
 
     if not matched_uid:
         matched_uid = next(
@@ -114,15 +147,18 @@ def import_single_file(
         )
         return 0, 0
 
+    earliest_day = min(r[0] for r in parsed_rows)
     if matched_uid not in data["users"]:
         data["users"][matched_uid] = {
             "twitch_name": twitch_login,
-            "display_name": twitch_login,
-            "connected_at": min(r[0] for r in parsed_rows),
+            "display_name": forced_display or twitch_login,
+            "connected_at": earliest_day,
         }
     else:
+        data["users"][matched_uid]["twitch_name"] = twitch_login
+        if forced_display:
+            data["users"][matched_uid]["display_name"] = forced_display
         existing_start = data["users"][matched_uid].get("connected_at")
-        earliest_day = min(r[0] for r in parsed_rows)
         if not existing_start or earliest_day < existing_start:
             data["users"][matched_uid]["connected_at"] = earliest_day
 
@@ -156,7 +192,8 @@ def import_single_file(
         }
 
     print(
-        f"✅ {os.path.basename(filepath)} -> User '{twitch_login}' (Discord {matched_uid}): "
+        f"✅ {os.path.basename(filepath)} -> User '{twitch_login}' "
+        f"(Discord {matched_uid}, Display '{data['users'][matched_uid]['display_name']}'): "
         f"{len(parsed_rows):,} Nachrichten an {len(by_day)} Stream-Tagen importiert!"
     )
     return len(parsed_rows), len(by_day)
@@ -168,11 +205,13 @@ def main() -> None:
     )
     parser.add_argument("files", nargs="+", help="Pfad(e) zu den exportierten .txt-Dateien")
     parser.add_argument("--data", default=DEFAULT_DATA_FILE, help="Pfad zur data.json")
-    parser.add_argument("--discord-id", help="Optionale Discord-User-ID (falls noch nicht verknüpft)")
+    parser.add_argument("--reset", action="store_true", help="Alte data.json vor dem Import komplett leeren")
+    parser.add_argument("--discord-id", help="Optionale Discord-User-ID")
     parser.add_argument("--twitch-name", help="Optionaler Twitch-Loginname")
+    parser.add_argument("--display-name", help="Optionaler Anzeigename im Discord")
     args = parser.parse_args()
 
-    data = _load_json(args.data)
+    data = _load_json(args.data, reset=args.reset)
     total_msgs = 0
     total_days = 0
 
@@ -180,14 +219,20 @@ def main() -> None:
         if not os.path.isfile(fp):
             print(f"⚠️ Datei nicht gefunden: {fp}")
             continue
-        m_cnt, d_cnt = import_single_file(fp, data, args.discord_id, args.twitch_name)
+        m_cnt, d_cnt = import_single_file(
+            fp,
+            data,
+            forced_uid=args.discord_id,
+            forced_twitch=args.twitch_name,
+            forced_display=args.display_name,
+        )
         total_msgs += m_cnt
         total_days += d_cnt
 
-    if total_msgs > 0:
+    if total_msgs > 0 or args.reset:
         _save_json_atomic(args.data, data)
         print(
-            f"\n🎉 Fertig! Insgesamt {total_msgs:,} Nachrichten ({total_days} Tage) "
+            f"\n🎉 Fertig! Insgesamt {total_msgs:,} Nachrichten ({total_days} User-Stream-Tage) "
             f"in {args.data} gespeichert."
         )
 

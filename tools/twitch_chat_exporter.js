@@ -941,16 +941,25 @@
   // ── 5) Deduplizierung, Sortierung & .txt-Download ────────────────────────
   function buildCleanSortedList() {
     const all = Array.from(collected.values());
+    const gqlDays = new Set();
     const gqlFingerprints = new Set();
     for (const m of all) {
       if (m.source === "gql") {
+        gqlDays.add(m.dateIso);
         gqlFingerprints.add(`${m.dateIso}|${m.minuteKey}|${normText(m.text)}`);
       }
     }
 
     const filtered = all.filter((m) => {
-      if (m.source === "dom" && gqlFingerprints.has(`${m.dateIso}|${m.minuteKey}|${normText(m.text)}`)) {
-        return false;
+      if (m.source === "dom") {
+        // Header-Artefakte ("[Datum 00:00] user: user") immer verwerfen
+        if (!m.hasSeconds && m.minuteKey === "00:00" && normText(m.text).toLowerCase() === normText(m.user).toLowerCase()) {
+          return false;
+        }
+        // Wenn der Tag bereits vollständig per GQL (inkl. Seite-1-Backfill) geladen wurde, DOM-Duplikate ignorieren
+        if (gqlDays.has(m.dateIso) || gqlFingerprints.has(`${m.dateIso}|${m.minuteKey}|${normText(m.text)}`)) {
+          return false;
+        }
       }
       return true;
     });
