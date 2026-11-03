@@ -1,0 +1,197 @@
+{% extends "base.html" %}
+{% block title %}Übersicht{% endblock %}
+{% block page_title %}Übersicht{% endblock %}
+{% block content %}
+
+<!-- Stats Row -->
+<div class="grid-4 gap2">
+  <div class="stat-card v-green">
+    <div class="stat-top">
+      <span class="stat-label">Mitglieder</span>
+      <div class="stat-icon-wrap">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
+      </div>
+    </div>
+    <div class="stat-value">{{ guild.member_count if guild else '–' }}</div>
+    <div class="stat-meta">{{ guild.online_count if guild else 0 }} gerade online</div>
+  </div>
+
+  <div class="stat-card v-blue">
+    <div class="stat-top">
+      <span class="stat-label">Nachrichten</span>
+      <div class="stat-icon-wrap">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </div>
+    </div>
+    <div class="stat-value" id="sv-msgs">{{ "{:,}".format(summary.total_messages or 0) }}</div>
+    <div class="stat-meta">Alle Zeiten gezählt</div>
+  </div>
+
+  <div class="stat-card v-red">
+    <div class="stat-top">
+      <span class="stat-label">Neue Mitglieder</span>
+      <div class="stat-icon-wrap">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+      </div>
+    </div>
+    <div class="stat-value" id="sv-joins">{{ summary.total_joins or 0 }}</div>
+    <div class="stat-meta">Seit Tracking-Start</div>
+  </div>
+
+  <div class="stat-card v-amber">
+    <div class="stat-top">
+      <span class="stat-label">Twitch Mods</span>
+      <div class="stat-icon-wrap">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+      </div>
+    </div>
+    <div class="stat-value" id="sv-mods">{{ summary.total_mod_actions or 0 }}</div>
+    <div class="stat-meta">Gesamt Aktionen</div>
+  </div>
+</div>
+
+<!-- Row 2: Musik + Voice -->
+<div class="grid-2 gap">
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-header-icon" style="background:var(--blue-glow)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--blue2)" stroke-width="2"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+      </div>
+      <span class="card-title">Jetzt spielt</span>
+      {% if now_playing %}
+        <span class="card-badge badge-green">Live</span>
+      {% endif %}
+      <a href="{{ url_for('_music') }}" class="card-link">Details →</a>
+    </div>
+    <div id="np-box">
+      {% if now_playing %}
+        <div class="now-playing">
+          {% if now_playing.thumbnail %}
+            <img class="np-artwork" src="{{ now_playing.thumbnail }}" alt="">
+          {% else %}
+            <div class="np-artwork-ph">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+            </div>
+          {% endif %}
+          <div class="np-info">
+            <div class="np-title">{{ now_playing.title }}</div>
+            <div class="np-meta">
+              Angefragt von <strong>{{ now_playing.requester or '?' }}</strong>
+              · {{ now_playing.duration_str or '' }}
+              {% if now_playing.webpage_url %}· <a href="{{ now_playing.webpage_url }}" target="_blank">YouTube</a>{% endif %}
+            </div>
+          </div>
+          <div class="np-wave">
+            <div class="np-bar" style="height:8px"></div>
+            <div class="np-bar" style="height:14px"></div>
+            <div class="np-bar" style="height:6px"></div>
+          </div>
+        </div>
+      {% else %}
+        <div class="np-idle">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+          Kein Song spielt gerade
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-header-icon" style="background:var(--purple-glow)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--purple)" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+      </div>
+      <span class="card-title">Voice Kanäle</span>
+      <span class="card-badge badge-purple">{{ vc_list|length }}</span>
+    </div>
+    <div class="scrollable">
+      {% if vc_list %}
+        {% for vc in vc_list %}
+          <div class="vc-row">
+            <svg class="vc-icon" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/></svg>
+            <span class="vc-name">{{ vc.name }}</span>
+            {% if vc.user_limit %}<span class="vc-limit">max {{ vc.user_limit }}</span>{% endif %}
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty-state">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/></svg>
+          <p>Keine Voice-Kanäle</p>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+<!-- Row 3: Logs -->
+<div class="grid-2 gap">
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-header-icon" style="background:var(--green-glow)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--green)" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg>
+      </div>
+      <span class="card-title">Neue Mitglieder</span>
+      <a href="{{ url_for('_logs') }}" class="card-link">Alle →</a>
+    </div>
+    <div class="scrollable feed" id="join-list">
+      {% if recent_joins %}
+        {% for item in recent_joins %}
+          <div class="feed-item">
+            <div class="feed-dot {{ 'fd-red' if item.suspicious else 'fd-green' }}"></div>
+            <div class="feed-body">
+              <div class="feed-text">
+                <strong>{{ item.name or '?' }}</strong>
+                {% if item.suspicious %}
+                  <span class="card-badge badge-red" style="margin-left:6px">Verdächtig</span>
+                {% endif %}
+              </div>
+              <div class="feed-time">{{ item.ts[:19].replace('T',' ') if item.ts else '–' }} · Account {{ item.age_days or 0 }} Tage alt</div>
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty-state">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
+          <p>Noch keine Mitglieder erfasst</p>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-header-icon" style="background:var(--amber-glow)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--amber)" stroke-width="2"><path d="M21 2H3v16h5v4l4-4h5l4-4V2z"/><line x1="11" y1="7" x2="11" y2="11"/><line x1="16" y1="7" x2="16" y2="11"/></svg>
+      </div>
+      <span class="card-title">Twitch Mod Logger</span>
+      <a href="{{ url_for('_logs') }}" class="card-link">Alle →</a>
+    </div>
+    <div class="scrollable feed" id="mod-list">
+      {% if recent_mod %}
+        {% for item in recent_mod %}
+          <div class="feed-item">
+            <div class="feed-dot fd-amber"></div>
+            <div class="feed-body">
+              <div class="feed-text">
+                <strong>{{ item.action or '?' }}</strong> → {{ item.target or '?' }}
+                {% if item.moderator %}<span class="text-muted"> · {{ item.moderator }}</span>{% endif %}
+              </div>
+              <div class="feed-time">{{ item.ts[:19].replace('T',' ') if item.ts else '–' }}{% if item.reason %} · {{ item.reason[:60] }}{% endif %}</div>
+            </div>
+          </div>
+        {% endfor %}
+      {% else %}
+        <div class="empty-state">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+          <p>Noch keine Mod-Aktionen erfasst</p>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+{% endblock %}

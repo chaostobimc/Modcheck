@@ -1,0 +1,20 @@
+{% extends "base.html" %}
+{% block title %}ByGorgii — Willkommen{% endblock %}
+{% block content %}
+<div class="page-center" style="text-align:center;padding-top:80px">
+  <div style="width:72px;height:72px;border-radius:18px;background:var(--blue-g);border:1px solid var(--blue-r);display:flex;align-items:center;justify-content:center;margin:0 auto 24px">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--blue2)" stroke-width="1.5" style="width:32px;height:32px"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+  </div>
+  <h1 style="font-size:2rem;font-weight:800;letter-spacing:-.03em;margin-bottom:10px">ByGorgii Community</h1>
+  <p style="font-size:1rem;color:var(--t2);margin-bottom:32px;line-height:1.6">
+    Um Zugang zu allen Kanälen zu erhalten,<br>musst du dich einmalig verifizieren.
+  </p>
+  <a href="/verify" class="btn btn-primary btn-lg">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+    Jetzt verifizieren
+  </a>
+  <p style="margin-top:16px;font-size:.75rem;color:var(--t3)">
+    Mit der Verifizierung stimmst du unseren <a href="/tos">Nutzungsbedingungen</a> zu.
+  </p>
+</div>
+{% endblock %}

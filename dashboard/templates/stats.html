@@ -1,0 +1,213 @@
+{% extends "base.html" %}
+{% block title %}Statistiken{% endblock %}
+{% block page_title %}Statistiken{% endblock %}
+{% block content %}
+
+<div class="grid-4 gap2">
+  <div class="stat-card v-blue">
+    <div class="stat-top">
+      <span class="stat-label">Nachrichten</span>
+      <div class="stat-icon-wrap"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg></div>
+    </div>
+    <div class="stat-value">{{ "{:,}".format(summary.total_messages or 0) }}</div>
+    <div class="stat-meta">Alle Zeiten</div>
+  </div>
+  <div class="stat-card v-purple">
+    <div class="stat-top">
+      <span class="stat-label">Voice-Zeit</span>
+      <div class="stat-icon-wrap"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg></div>
+    </div>
+    <div class="stat-value">{{ ((summary.total_voice_secs or 0) // 3600) }}h</div>
+    <div class="stat-meta">{{ ((summary.total_voice_secs or 0) % 3600 // 60) }} Minuten Rest</div>
+  </div>
+  <div class="stat-card v-amber">
+    <div class="stat-top">
+      <span class="stat-label">Mod-Aktionen</span>
+      <div class="stat-icon-wrap"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg></div>
+    </div>
+    <div class="stat-value">{{ summary.total_mod_actions or 0 }}</div>
+    <div class="stat-meta">Twitch</div>
+  </div>
+  <div class="stat-card v-green">
+    <div class="stat-top">
+      <span class="stat-label">Neue Mitglieder</span>
+      <div class="stat-icon-wrap"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></svg></div>
+    </div>
+    <div class="stat-value">{{ summary.total_joins or 0 }}</div>
+    <div class="stat-meta">Gesamt erfasst</div>
+  </div>
+</div>
+
+<!-- Charts -->
+<div class="grid-2 gap2">
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-header-icon" style="background:var(--blue-glow)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--blue2)" stroke-width="2"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>
+      </div>
+      <span class="card-title">Nachrichten — 14 Tage</span>
+    </div>
+    <div class="card-body">
+      {% set total_m = daily_messages|map(attribute='count')|sum %}
+      {% if total_m == 0 %}
+        <div class="empty-state" style="padding:24px 0">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+          <p>Noch keine Daten. Wird erfasst sobald der Bot läuft und Nachrichten geschrieben werden.</p>
+        </div>
+      {% else %}
+        {% set max_m = daily_messages|map(attribute='count')|max %}
+        {% if max_m == 0 %}{% set max_m = 1 %}{% endif %}
+        <div class="chart-wrap">
+          <div class="chart-columns">
+            {% for day in daily_messages %}
+              {% set pct = (day.count / max_m * 100)|round|int %}
+              <div class="chart-col" data-tip="{{ day.date[5:] }}: {{ day.count }} Nachrichten">
+                <div class="chart-bar bar-blue" style="height:{{ [pct,2]|max }}%"></div>
+                <div class="chart-label">{{ day.date[8:] }}</div>
+              </div>
+            {% endfor %}
+          </div>
+          <div class="chart-y-axis">
+            <span>{{ max_m }}</span>
+            <span>{{ (max_m/2)|int }}</span>
+            <span>0</span>
+          </div>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-header-icon" style="background:var(--purple-glow)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--purple)" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/></svg>
+      </div>
+      <span class="card-title">Voice-Zeit — 14 Tage</span>
+    </div>
+    <div class="card-body">
+      {% set total_v = daily_voice|map(attribute='seconds')|sum %}
+      {% if total_v == 0 %}
+        <div class="empty-state" style="padding:24px 0">
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/></svg>
+          <p>Noch keine Daten. Wird erfasst sobald jemand einem Voice-Kanal beitritt.</p>
+        </div>
+      {% else %}
+        {% set max_v = daily_voice|map(attribute='seconds')|max %}
+        {% if max_v == 0 %}{% set max_v = 1 %}{% endif %}
+        <div class="chart-wrap">
+          <div class="chart-columns">
+            {% for day in daily_voice %}
+              {% set pct = (day.seconds / max_v * 100)|round|int %}
+              <div class="chart-col" data-tip="{{ day.date[5:] }}: {{ (day.seconds//3600) }}h {{ ((day.seconds%3600)//60) }}m">
+                <div class="chart-bar bar-purple" style="height:{{ [pct,2]|max }}%"></div>
+                <div class="chart-label">{{ day.date[8:] }}</div>
+              </div>
+            {% endfor %}
+          </div>
+          <div class="chart-y-axis">
+            <span>{{ (max_v//3600) }}h</span>
+            <span>{{ (max_v//7200) }}h</span>
+            <span>0</span>
+          </div>
+        </div>
+      {% endif %}
+    </div>
+  </div>
+
+</div>
+
+<!-- Leaderboards -->
+<div class="grid-2 gap2">
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-header-icon" style="background:var(--blue-glow)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--blue2)" stroke-width="2"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg>
+      </div>
+      <span class="card-title">Nachrichten</span>
+    </div>
+    {% if msg_leaderboard %}
+      {% set mx = msg_leaderboard[0].total if msg_leaderboard else 1 %}
+      {% if mx == 0 %}{% set mx = 1 %}{% endif %}
+      <div class="scrollable">
+        {% for i, item in enumerate(msg_leaderboard) %}
+          <div class="lb-item">
+            <div class="lb-rank">{% if i==0 %}🥇{% elif i==1 %}🥈{% elif i==2 %}🥉{% else %}<span class="text-faint" style="font-size:.75rem">{{ i+1 }}</span>{% endif %}</div>
+            <div class="lb-info">
+              <div class="lb-name">{{ item.username }}</div>
+              <div class="lb-bar-track"><div class="lb-bar-fill lb-fill-blue" style="width:{{ (item.total/mx*100)|round|int }}%"></div></div>
+            </div>
+            <div class="lb-value">{{ "{:,}".format(item.total) }}</div>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></svg><p>Keine Daten vorhanden</p></div>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <div class="card-header">
+      <div class="card-header-icon" style="background:var(--purple-glow)">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--purple)" stroke-width="2"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/></svg>
+      </div>
+      <span class="card-title">Voice-Zeit</span>
+    </div>
+    {% if voice_leaderboard %}
+      {% set mx = voice_leaderboard[0].seconds if voice_leaderboard else 1 %}
+      {% if mx == 0 %}{% set mx = 1 %}{% endif %}
+      <div class="scrollable">
+        {% for i, item in enumerate(voice_leaderboard) %}
+          <div class="lb-item">
+            <div class="lb-rank">{% if i==0 %}🥇{% elif i==1 %}🥈{% elif i==2 %}🥉{% else %}<span class="text-faint" style="font-size:.75rem">{{ i+1 }}</span>{% endif %}</div>
+            <div class="lb-info">
+              <div class="lb-name">{{ item.username }}</div>
+              <div class="lb-bar-track"><div class="lb-bar-fill lb-fill-purple" style="width:{{ (item.seconds/mx*100)|round|int }}%"></div></div>
+            </div>
+            <div class="lb-value">{{ (item.seconds//3600) }}h {{ ((item.seconds%3600)//60) }}m</div>
+          </div>
+        {% endfor %}
+      </div>
+    {% else %}
+      <div class="empty-state"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/></svg><p>Keine Daten vorhanden</p></div>
+    {% endif %}
+  </div>
+
+</div>
+
+<!-- Gambling -->
+<div class="card">
+  <div class="card-header">
+    <div class="card-header-icon" style="background:var(--amber-glow)">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--amber)" stroke-width="2"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg>
+    </div>
+    <span class="card-title">Gambling — Profit-Leaderboard</span>
+  </div>
+  {% if gambling_lb %}
+    <div class="scrollable">
+      <table class="data-table">
+        <thead>
+          <tr><th>#</th><th>Spieler</th><th>Siege</th><th>Niederlagen</th><th>Profit</th></tr>
+        </thead>
+        <tbody>
+          {% for i, item in enumerate(gambling_lb) %}
+            <tr>
+              <td>{% if i==0 %}🥇{% elif i==1 %}🥈{% elif i==2 %}🥉{% else %}{{ i+1 }}{% endif %}</td>
+              <td><strong>{{ item.username }}</strong></td>
+              <td style="color:var(--green)">{{ item.wins }}</td>
+              <td style="color:var(--red)">{{ item.losses }}</td>
+              <td style="font-weight:700;color:{% if item.profit>=0 %}var(--green){% else %}var(--red){% endif %}">
+                {% if item.profit>=0 %}+{% endif %}{{ "{:,}".format(item.profit) }} 🪙
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% else %}
+    <div class="empty-state" style="padding:32px"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="12" y1="1" x2="12" y2="23"/><path d="M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6"/></svg><p>Keine Gambling-Daten vorhanden</p></div>
+  {% endif %}
+</div>
+
+{% endblock %}

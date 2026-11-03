@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% block title %}Verifiziert — ByGorgii{% endblock %}
+{% block content %}
+<div class="page-center" style="text-align:center;padding-top:70px">
+
+  <div style="width:80px;height:80px;border-radius:50%;background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.3);display:flex;align-items:center;justify-content:center;margin:0 auto 24px">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="1.5" style="width:36px;height:36px"><polyline points="20 6 9 17 4 12"/></svg>
+  </div>
+
+  <h1 style="font-size:1.8rem;font-weight:800;margin-bottom:10px;color:#10b981">Verifiziert!</h1>
+  <p style="font-size:.95rem;color:var(--t2);line-height:1.7;margin-bottom:28px">
+    {% if session and session.discord_name %}
+      Hey <strong style="color:var(--t1)">{{ session.discord_name }}</strong>! 
+    {% endif %}
+    Du hast die Verified-Rolle erhalten und hast jetzt Zugang zu allen Kanälen.<br>
+    Du kannst diesen Tab schließen.
+  </p>
+
+  {% if session and session.ip_info %}
+    <div style="background:var(--s2);border:1px solid var(--border);border-radius:var(--r2);padding:16px;text-align:left;margin-bottom:20px">
+      <p style="font-size:.72rem;font-weight:700;text-transform:uppercase;letter-spacing:.08em;color:var(--t3);margin-bottom:10px">Erkannte Standortdaten</p>
+      <div style="display:flex;gap:16px;flex-wrap:wrap">
+        {% if session.ip_info.country %}
+          <div>
+            <div style="font-size:.7rem;color:var(--t3)">Land</div>
+            <div style="font-size:.85rem;font-weight:600">{{ session.ip_info.country_code }} {{ session.ip_info.country }}</div>
+          </div>
+        {% endif %}
+        {% if session.ip_info.city %}
+          <div>
+            <div style="font-size:.7rem;color:var(--t3)">Region</div>
+            <div style="font-size:.85rem;font-weight:600">{{ session.ip_info.city }}</div>
+          </div>
+        {% endif %}
+        {% if session.ip_info.isp %}
+          <div>
+            <div style="font-size:.7rem;color:var(--t3)">Internetanbieter</div>
+            <div style="font-size:.85rem;font-weight:600">{{ session.ip_info.isp }}</div>
+          </div>
+        {% endif %}
+        {% if session.ip_info.is_vpn %}
+          <div>
+            <span class="badge badge-amber">VPN erkannt</span>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+  {% endif %}
+
+  <a href="https://discord.com" class="btn btn-primary">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="currentColor" style="width:18px;height:18px"><path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057c.002.022.01.04.02.054a19.9 19.9 0 0 0 5.993 3.03.077.077 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03z"/></svg>
+    Zurück zu Discord
+  </a>
+
+</div>
+{% endblock %}

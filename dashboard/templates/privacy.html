@@ -1,0 +1,134 @@
+{% extends "legal.html" %}
+{% block title %}Datenschutzerklärung{% endblock %}
+
+{% block content %}
+<div class="legal-header">
+  <div class="legal-tag">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
+    Rechtliches
+  </div>
+  <h1 class="legal-title">Datenschutzerklärung</h1>
+  <p class="legal-meta">Zuletzt aktualisiert: {{ now.strftime('%d. %B %Y') }} · ByGorgii Community</p>
+</div>
+
+<div class="legal-highlight">
+  Der Schutz deiner Daten ist uns wichtig. Diese Erklärung beschreibt, welche Daten wir erheben, wie wir sie verwenden und welche Rechte du hast.
+</div>
+
+<div class="legal-divider"></div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">1. Verantwortliche Stelle</h2>
+  <p class="legal-p">Verantwortlich für die Datenverarbeitung im Rahmen der ByGorgii Community ist die Serveradministration. Da es sich um ein privates, nicht-kommerzielles Projekt handelt, ist kein formelles Impressum erforderlich. Kontakt ist über den Discord-Server möglich.</p>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">2. Welche Daten werden erfasst?</h2>
+  <p class="legal-p">Wir erheben und speichern folgende Daten:</p>
+
+  <p class="legal-p" style="font-weight:600;color:var(--t1);margin-top:14px">Discord-Daten (automatisch durch Discord bereitgestellt):</p>
+  <ul class="legal-ul">
+    <li>Discord-User-ID (öffentliche Kennnummer)</li>
+    <li>Anzeigename zum Zeitpunkt der Registrierung</li>
+  </ul>
+
+  <p class="legal-p" style="font-weight:600;color:var(--t1);margin-top:14px">Bot-Aktivitätsdaten (nur mit expliziter Verknüpfung):</p>
+  <ul class="legal-ul">
+    <li>Verknüpfter Twitch-Benutzername</li>
+    <li>Anwesenheitsdaten im Twitch-Chat (welche Tage aktiv)</li>
+    <li>Nachrichtenzähler pro Stream-Tag (keine Inhalte, nur Anzahl)</li>
+    <li>Zeitpunkt erster und letzter Aktivität</li>
+  </ul>
+
+  <p class="legal-p" style="font-weight:600;color:var(--t1);margin-top:14px">Gambling- und Minigame-Daten:</p>
+  <ul class="legal-ul">
+    <li>Virtuelles Coin-Guthaben</li>
+    <li>Angel-Statistiken, Job-Fortschritte</li>
+    <li>Spielergebnisse (Gambling-Wins/Losses)</li>
+    <li>Voice-Chat-Zeiten (Dauer, kein Inhalt)</li>
+  </ul>
+
+  <div class="legal-box">
+    <p><strong>Wichtig:</strong> Nachrichteninhalte werden nicht gespeichert. Wir speichern ausschließlich Metadaten (Zeitpunkte, Zähler) — niemals den Text von Nachrichten.</p>
+  </div>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">3. Zweck der Datenverarbeitung</h2>
+  <p class="legal-p">Die erhobenen Daten werden ausschließlich für folgende Zwecke verwendet:</p>
+  <ul class="legal-ul">
+    <li>Bereitstellung und Betrieb der Bot-Features (Gambling, Angeln, Musik etc.)</li>
+    <li>Erstellung von Aktivitätsberichten und Streak-Tracking für Moderatoren</li>
+    <li>Anzeige von Leaderboards und persönlichen Statistiken</li>
+    <li>Sicherheit: Erkennung von verdächtigen Accounts (Account-Alter, VPN-Erkennung)</li>
+    <li>Administration und Moderation des Servers</li>
+  </ul>
+  <p class="legal-p">Eine Weitergabe an Dritte erfolgt nicht. Die Daten werden nicht für Werbezwecke genutzt.</p>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">4. Datenspeicherung</h2>
+  <p class="legal-p">Alle Daten werden lokal auf dem Server gespeichert, auf dem der Bot betrieben wird. Es werden keine Cloud-Dienste zur Datenspeicherung genutzt. Die Daten werden in JSON-Dateien gespeichert.</p>
+  <p class="legal-p">Daten werden gespeichert, solange du Mitglied der Community bist. Nach Austritt oder auf Anfrage werden deine Daten gelöscht.</p>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">5. Drittdienste</h2>
+  <p class="legal-p">Unser Bot nutzt folgende externe Dienste, die eigene Datenschutzrichtlinien haben:</p>
+
+  <p class="legal-p" style="font-weight:600;color:var(--t1);margin-top:14px">Discord</p>
+  <p class="legal-p">Für den Betrieb des Servers und Bots. Discord verarbeitet Nutzerdaten gemäß ihrer eigenen Datenschutzrichtlinie: <a href="https://discord.com/privacy" target="_blank">discord.com/privacy</a></p>
+
+  <p class="legal-p" style="font-weight:600;color:var(--t1);margin-top:14px">Twitch</p>
+  <p class="legal-p">Für das Tracking von Chat-Aktivitäten im Twitch-Stream. Twitch-Richtlinie: <a href="https://www.twitch.tv/p/de-de/legal/privacy-notice/" target="_blank">twitch.tv/privacy</a></p>
+
+  <p class="legal-p" style="font-weight:600;color:var(--t1);margin-top:14px">OpenRouter / KI-Anbieter</p>
+  <p class="legal-p">Wenn du den Bot per @-Erwähnung eine Frage stellst, wird deine Nachricht an einen KI-Dienst übermittelt. Es werden keine personenbezogenen Daten außer dem Nachrichtentext selbst übertragen.</p>
+
+  <p class="legal-p" style="font-weight:600;color:var(--t1);margin-top:14px">ProxyCheck.io</p>
+  <p class="legal-p">Bei neuen Servermitgliedern wird die IP-Adresse nicht gespeichert — lediglich Account-Metadaten (Alter, Avatar) werden auf Verdächtigkeit geprüft. ProxyCheck.io erhält keine Discord-IDs.</p>
+
+  <p class="legal-p" style="font-weight:600;color:var(--t1);margin-top:14px">YouTube (yt-dlp)</p>
+  <p class="legal-p">Beim Abspielen von Musik werden YouTube-Links aufgelöst. Es werden keine Nutzerdaten an YouTube übermittelt.</p>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">6. Deine Rechte</h2>
+  <p class="legal-p">Du hast jederzeit das Recht auf:</p>
+  <ul class="legal-ul">
+    <li><strong>Auskunft</strong> — Welche Daten wir über dich gespeichert haben</li>
+    <li><strong>Berichtigung</strong> — Korrektur falscher Daten</li>
+    <li><strong>Löschung</strong> — Vollständige Löschung deiner Daten</li>
+    <li><strong>Widerspruch</strong> — Widerspruch gegen die Verarbeitung</li>
+  </ul>
+  <div class="legal-box">
+    <p>Zur Ausübung deiner Rechte wende dich per Discord an die Serveradministration oder nutze den <strong>/disconnect</strong>-Befehl um deine Verknüpfung und die damit verbundenen Tracking-Daten zu entfernen.</p>
+  </div>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">7. Opt-Out</h2>
+  <p class="legal-p">Das Aktivitätstracking ist vollständig optional und opt-in. Du kannst es jederzeit deaktivieren:</p>
+  <ul class="legal-ul">
+    <li>Verknüpfung aufheben: <strong>/disconnect</strong> im Discord</li>
+    <li>Damit werden keine weiteren Aktivitätsdaten erfasst</li>
+    <li>Bestehende Daten können auf Anfrage gelöscht werden</li>
+  </ul>
+  <p class="legal-p">Gambling- und Minigame-Daten existieren, solange du den Bot nutzt. Nach Serveraustritt können diese auf Anfrage gelöscht werden.</p>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">8. Datensicherheit</h2>
+  <p class="legal-p">Wir treffen angemessene technische Maßnahmen zum Schutz deiner Daten:</p>
+  <ul class="legal-ul">
+    <li>Lokale Speicherung auf dem Bot-Server (kein Cloud-Upload)</li>
+    <li>Das Admin-Dashboard ist durch Discord OAuth2 geschützt und nur für eingetragene Administratoren zugänglich</li>
+    <li>Tokens und API-Keys werden nicht in den Daten gespeichert</li>
+  </ul>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">9. Änderungen dieser Erklärung</h2>
+  <p class="legal-p">Wir behalten uns vor, diese Datenschutzerklärung bei Bedarf zu aktualisieren. Wesentliche Änderungen werden im Server kommuniziert.</p>
+</div>
+{% endblock %}

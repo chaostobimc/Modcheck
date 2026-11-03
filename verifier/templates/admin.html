@@ -1,0 +1,121 @@
+{% extends "base.html" %}
+{% block title %}Admin — ByGorgii Verifier{% endblock %}
+{% block content %}
+<div class="page">
+
+  <h1 style="font-size:1.4rem;font-weight:800;margin-bottom:20px">Admin-Panel</h1>
+
+  <div class="g4 mb" style="margin-bottom:20px">
+    <div class="stat-card">
+      <div class="stat-label">Verifiziert</div>
+      <div class="stat-val" style="color:var(--blue2)">{{ stats.total }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Gebannt</div>
+      <div class="stat-val" style="color:var(--red)">{{ stats.banned }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">VPN-Nutzer</div>
+      <div class="stat-val" style="color:var(--amber)">{{ stats.vpn_users }}</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-label">Heute</div>
+      <div class="stat-val" style="color:var(--green)">{{ stats.today }}</div>
+    </div>
+  </div>
+
+  <!-- Suche -->
+  <form method="get" style="display:flex;gap:10px;margin-bottom:20px">
+    <input name="q" value="{{ query }}" placeholder="Suche nach Discord-ID, Name, ISP, Land..." class="form-input" style="flex:1">
+    <button type="submit" class="btn btn-primary">Suchen</button>
+    {% if query %}<a href="/admin" class="btn btn-ghost">Reset</a>{% endif %}
+  </form>
+
+  <!-- User-Tabelle -->
+  <div class="card mb" style="margin-bottom:20px">
+    <div class="card-head">
+      <span class="card-title">{{ 'Suchergebnisse' if query else 'Neueste Verifikationen' }}</span>
+      <span style="font-size:.75rem;color:var(--t2)">{{ users|length }} Einträge</span>
+    </div>
+    <div class="scroll">
+      <table class="tbl">
+        <thead>
+          <tr>
+            <th>Discord-ID</th>
+            <th>Name</th>
+            <th>Land</th>
+            <th>ISP</th>
+            <th>VPN</th>
+            <th>Status</th>
+            <th>Zuletzt</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for u in users %}
+            <tr>
+              <td><code style="font-size:.75rem">{{ u.discord_id }}</code></td>
+              <td><strong>{{ u.discord_name or '–' }}</strong></td>
+              <td>{{ u.country_code or '–' }} {{ u.country or '' }}</td>
+              <td style="max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{{ u.isp or '–' }}</td>
+              <td>
+                {% if u.is_vpn %}<span class="badge badge-amber">VPN</span>
+                {% elif u.is_proxy %}<span class="badge badge-amber">Proxy</span>
+                {% else %}<span style="color:var(--t3)">–</span>{% endif %}
+              </td>
+              <td>
+                {% if u.is_banned %}
+                  <span class="badge badge-red">Gebannt</span>
+                {% else %}
+                  <span class="badge badge-green">OK</span>
+                {% endif %}
+              </td>
+              <td style="color:var(--t3);font-size:.75rem">{{ u.last_seen[:16] if u.last_seen else '–' }}</td>
+              <td>
+                <a href="/admin/user/{{ u.discord_id }}" class="btn btn-ghost" style="padding:4px 10px;font-size:.72rem">Details</a>
+              </td>
+            </tr>
+          {% else %}
+            <tr><td colspan="8" style="text-align:center;color:var(--t3);padding:24px">Keine Einträge</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Bann-Liste -->
+  {% if banned %}
+    <div class="card">
+      <div class="card-head">
+        <span class="card-title" style="color:var(--red)">Gebannte Accounts</span>
+        <span style="font-size:.75rem;color:var(--t2)">{{ banned|length }}</span>
+      </div>
+      <div class="scroll">
+        <table class="tbl">
+          <thead>
+            <tr><th>Discord-ID</th><th>Name</th><th>Land / ISP</th><th>Grund</th><th>Gebannt am</th><th></th></tr>
+          </thead>
+          <tbody>
+            {% for b in banned %}
+              <tr>
+                <td><code style="font-size:.75rem">{{ b.discord_id }}</code></td>
+                <td>{{ b.discord_name or '–' }}</td>
+                <td>{{ b.country_code or '' }} {{ b.isp or '–' }}</td>
+                <td style="max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--t2)">{{ b.ban_reason or '–' }}</td>
+                <td style="color:var(--t3);font-size:.75rem">{{ b.banned_at[:16] if b.banned_at else '–' }}</td>
+                <td>
+                  <form method="post" action="/admin/unban" style="display:inline">
+                    <input type="hidden" name="discord_id" value="{{ b.discord_id }}">
+                    <button type="submit" class="btn btn-ghost" style="padding:4px 10px;font-size:.72rem;color:var(--green)">Entbannen</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  {% endif %}
+
+</div>
+{% endblock %}

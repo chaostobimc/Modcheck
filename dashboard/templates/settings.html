@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Einstellungen{% endblock %}
+{% block page_title %}Einstellungen{% endblock %}
+{% block content %}
+
+{% if saved %}
+  <div class="alert alert-success">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="20 6 9 17 4 12"/></svg>
+    Gespeichert. Bot-Neustart erforderlich für Token/ID-Änderungen.
+  </div>
+{% endif %}
+{% for err in errors %}
+  <div class="alert alert-error">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+    {{ err }}
+  </div>
+{% endfor %}
+
+{% set sections = [
+  ('core','Allgemein','M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z'),
+  ('twitch','Twitch','M21 2H3v16h5v4l4-4h5l4-4V2z M11 7v4 M16 7v4'),
+  ('voice','Voice Channels','M11 5 6 9 2 9 2 15 6 15 11 19 11 5 M15.54 8.46a5 5 0 0 1 0 7.07'),
+  ('gambling','Gambling & Angeln','M12 1v22 M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6'),
+  ('music','Musik','M9 18V5l12-2v13 M6 18m0 0a3 3 0 1 0 0 6 3 3 0 0 0 0-6'),
+  ('ai','KI','M12 2a10 10 0 1 0 0 20A10 10 0 0 0 12 2z M12 8v4 M12 16h.01'),
+  ('tickets','Ticket System','M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z M14 2v6h6'),
+  ('review','Review System','M8 6h13 M8 12h13 M8 18h13 M3 6h.01 M3 12h.01 M3 18h.01'),
+] %}
+
+<form method="POST">
+  <div class="settings-layout">
+    {% for sec_key, sec_label, sec_icon in sections %}
+      {% set items = editable | selectattr(3, 'eq', sec_key) | list %}
+      {% if items %}
+        <div class="card">
+          <div class="card-header">
+            <div class="card-header-icon" style="background:var(--blue-glow)">
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="var(--blue2)" stroke-width="2"><path d="{{ sec_icon }}"/></svg>
+            </div>
+            <span class="card-title">{{ sec_label }}</span>
+          </div>
+          <div class="card-body">
+            {% for env_key, label, typ, _ in items %}
+              <div class="form-group">
+                <label class="form-label" for="{{ env_key }}">{{ label }}</label>
+                {% if typ == 'bool' %}
+                  {% set is_on = settings.get(env_key, 'false') in ('true','1','yes') %}
+                  <div class="toggle-row">
+                    <label class="toggle">
+                      <input type="checkbox" name="{{ env_key }}_check" id="{{ env_key }}"{% if is_on %} checked{% endif %}>
+                      <div class="toggle-track"></div>
+                      <div class="toggle-thumb"></div>
+                    </label>
+                    <span class="toggle-label">{{ 'Aktiviert' if is_on else 'Deaktiviert' }}</span>
+                  </div>
+                {% elif typ == 'number' %}
+                  <input class="form-input" type="number" name="{{ env_key }}" id="{{ env_key }}" value="{{ settings.get(env_key,'') }}" min="0">
+                {% else %}
+                  <input class="form-input" type="text" name="{{ env_key }}" id="{{ env_key }}" value="{{ settings.get(env_key,'') }}"
+                    {% if 'TOKEN' in env_key or 'SECRET' in env_key or 'KEY' in env_key %}placeholder="(aus Sicherheitsgründen nicht angezeigt)"{% endif %}>
+                {% endif %}
+              </div>
+            {% endfor %}
+          </div>
+        </div>
+      {% endif %}
+    {% endfor %}
+  </div>
+
+  <div style="margin-top:24px;display:flex;align-items:center;gap:14px">
+    <button type="submit" class="btn btn-primary">
+      <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+      Speichern
+    </button>
+    <span style="font-size:.75rem;color:var(--t3)">Änderungen werden direkt in die .env Datei geschrieben.</span>
+  </div>
+</form>
+
+{% endblock %}
+
+{% block js %}
+<script>
+document.querySelectorAll(".toggle input").forEach(cb => {
+  cb.addEventListener("change", function() {
+    const lbl = this.closest(".toggle-row")?.querySelector(".toggle-label");
+    if (lbl) lbl.textContent = this.checked ? "Aktiviert" : "Deaktiviert";
+  });
+});
+</script>
+{% endblock %}

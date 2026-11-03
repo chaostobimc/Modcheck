@@ -1,0 +1,98 @@
+{% extends "base.html" %}
+{% block title %}User {{ discord_id }} — Admin{% endblock %}
+{% block content %}
+<div class="page">
+  <div style="display:flex;align-items:center;gap:12px;margin-bottom:24px">
+    <a href="/admin" class="btn btn-ghost" style="padding:6px 12px;font-size:.8rem">← Zurück</a>
+    <h1 style="font-size:1.2rem;font-weight:800">User: <code>{{ discord_id }}</code></h1>
+  </div>
+
+  {% if entries %}
+    {% set latest = entries[0] %}
+    <div class="g2 mb" style="margin-bottom:20px">
+      <div class="card">
+        <div class="card-head"><span class="card-title">Discord-Info</span></div>
+        <div class="card-body">
+          <p><strong>Name:</strong> {{ latest.discord_name or '–' }}</p>
+          <p class="mt"><strong>ID:</strong> <code>{{ discord_id }}</code></p>
+          <p class="mt"><strong>Status:</strong>
+            {% if latest.is_banned %}
+              <span class="badge badge-red">Gebannt</span>
+              {% if latest.ban_reason %}<span style="color:var(--t2);font-size:.8rem;margin-left:8px">{{ latest.ban_reason }}</span>{% endif %}
+            {% else %}
+              <span class="badge badge-green">Verifiziert</span>
+            {% endif %}
+          </p>
+          <p class="mt"><strong>Erstmals gesehen:</strong> {{ entries[-1].created_at[:16] if entries else '–' }}</p>
+          <p class="mt"><strong>Zuletzt gesehen:</strong> {{ latest.last_seen[:16] }}</p>
+        </div>
+      </div>
+      <div class="card">
+        <div class="card-head"><span class="card-title">Aktionen</span></div>
+        <div class="card-body">
+          {% if not latest.is_banned %}
+            <form method="post" action="/admin/ban">
+              <input type="hidden" name="discord_id" value="{{ discord_id }}">
+              <div class="form-group">
+                <label class="form-label">Banngrund</label>
+                <input name="reason" class="form-input" placeholder="z.B. Regelverstoß, Spam...">
+              </div>
+              <button type="submit" class="btn btn-danger" style="width:100%">Account bannen</button>
+            </form>
+            <p style="font-size:.73rem;color:var(--t3);margin-top:8px">Alle verknüpften Alt-Accounts werden automatisch mitgebannt.</p>
+          {% else %}
+            <form method="post" action="/admin/unban">
+              <input type="hidden" name="discord_id" value="{{ discord_id }}">
+              <button type="submit" class="btn btn-primary" style="width:100%;background:var(--green)">Account entbannen</button>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+    </div>
+
+    <!-- Verbundene IPs -->
+    <div class="card mb" style="margin-bottom:20px">
+      <div class="card-head"><span class="card-title">Bekannte IP-Hashes & Standorte</span></div>
+      <table class="tbl">
+        <thead>
+          <tr><th>IP-Hash (gekürzt)</th><th>Land</th><th>Stadt</th><th>ISP</th><th>VPN</th><th>Erstellt</th></tr>
+        </thead>
+        <tbody>
+          {% for e in entries %}
+            <tr>
+              <td><code style="font-size:.72rem">{{ e.ip_hash[:16] }}…</code></td>
+              <td>{{ e.country_code or '' }} {{ e.country or '–' }}</td>
+              <td>{{ e.city or '–' }}</td>
+              <td>{{ e.isp or '–' }}</td>
+              <td>{% if e.is_vpn %}<span class="badge badge-amber">VPN</span>{% else %}–{% endif %}</td>
+              <td style="color:var(--t3);font-size:.75rem">{{ e.created_at[:16] }}</td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <!-- Verknüpfte Accounts -->
+    {% if linked_ids %}
+      <div class="card">
+        <div class="card-head">
+          <span class="card-title" style="color:var(--amber)">Verknüpfte Accounts (gleiche IP)</span>
+          <span class="badge badge-amber">{{ linked_ids|length }}</span>
+        </div>
+        <div class="card-body">
+          {% for lid in linked_ids %}
+            <div style="display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border)">
+              <code style="font-size:.82rem">{{ lid }}</code>
+              <a href="/admin/user/{{ lid }}" class="btn btn-ghost" style="padding:4px 10px;font-size:.75rem">Details</a>
+            </div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+
+  {% else %}
+    <p style="color:var(--t2)">Kein Eintrag für diese Discord-ID gefunden.</p>
+  {% endif %}
+
+</div>
+{% endblock %}

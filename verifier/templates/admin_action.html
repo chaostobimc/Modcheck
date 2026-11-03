@@ -1,0 +1,22 @@
+{% extends "base.html" %}
+{% block title %}{{ title }} — Admin{% endblock %}
+{% block content %}
+<div class="page-center" style="padding-top:60px;text-align:center">
+  <div class="card">
+    <div class="card-body">
+      <div style="width:60px;height:60px;border-radius:50%;margin:0 auto 16px;display:flex;align-items:center;justify-content:center;
+        background:{% if success %}rgba(16,185,129,.12){% else %}rgba(239,68,68,.12){% endif %};
+        border:1px solid {% if success %}rgba(16,185,129,.25){% else %}rgba(239,68,68,.25){% endif %}">
+        {% if success %}
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#10b981" stroke-width="1.5" style="width:26px;height:26px"><polyline points="20 6 9 17 4 12"/></svg>
+        {% else %}
+          <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="#ef4444" stroke-width="1.5" style="width:26px;height:26px"><circle cx="12" cy="12" r="10"/><line x1="12" y1="8" x2="12" y2="12"/><line x1="12" y1="16" x2="12.01" y2="16"/></svg>
+        {% endif %}
+      </div>
+      <h2 style="font-size:1.2rem;font-weight:700;margin-bottom:10px">{{ title }}</h2>
+      <p style="font-size:.85rem;color:var(--t2);line-height:1.6;margin-bottom:20px">{{ message }}</p>
+      <a href="/admin" class="btn btn-primary">Zurück zum Admin-Panel</a>
+    </div>
+  </div>
+</div>
+{% endblock %}

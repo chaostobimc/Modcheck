@@ -1,0 +1,92 @@
+{% extends "legal.html" %}
+{% block title %}Nutzungsbedingungen{% endblock %}
+
+{% block content %}
+<div class="legal-header">
+  <div class="legal-tag">
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+    Rechtliches
+  </div>
+  <h1 class="legal-title">Nutzungsbedingungen</h1>
+  <p class="legal-meta">Zuletzt aktualisiert: {{ now.strftime('%d. %B %Y') }} · ByGorgii Community</p>
+</div>
+
+<div class="legal-highlight">
+  Durch die Nutzung des ByGorgii Discord-Servers und der damit verbundenen Dienste stimmst du diesen Nutzungsbedingungen zu. Bitte lies sie sorgfältig durch.
+</div>
+
+<div class="legal-divider"></div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">1. Geltungsbereich</h2>
+  <p class="legal-p">Diese Nutzungsbedingungen gelten für alle Mitglieder und Nutzer des ByGorgii Discord-Servers sowie der damit verbundenen Dienste, einschließlich des Discord-Bots und des Admin-Dashboards.</p>
+  <p class="legal-p">Mit dem Beitritt zum Server oder der Nutzung unserer Dienste erklärst du dich mit diesen Bedingungen einverstanden. Falls du nicht einverstanden bist, bitten wir dich, den Server zu verlassen und die Dienste nicht zu nutzen.</p>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">2. Verhaltensregeln</h2>
+  <p class="legal-p">Als Mitglied der ByGorgii Community verpflichtest du dich, folgende Regeln einzuhalten:</p>
+  <ul class="legal-ul">
+    <li>Respektvoller Umgang mit allen Mitgliedern und dem Team</li>
+    <li>Keine Beleidigungen, Hassrede, Diskriminierung oder Mobbing jeglicher Art</li>
+    <li>Keine Verbreitung von illegalen, obszönen oder anstößigen Inhalten</li>
+    <li>Keine Werbung, Spam oder unerwünschte Massenanfragen</li>
+    <li>Keine Versuche, den Server, den Bot oder andere Dienste zu manipulieren oder zu schädigen</li>
+    <li>Beachtung der geltenden Discord-Nutzungsbedingungen</li>
+    <li>Kein Cheating oder Exploiting im Rahmen von Bot-Features (Gambling, Angeln etc.)</li>
+  </ul>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">3. Nutzung des Discord-Bots</h2>
+  <p class="legal-p">Der ByGorgii Discord-Bot stellt verschiedene Features zur Verfügung, darunter Musik, Gambling, Minigames und Aktivitätstracking. Für die Nutzung gelten folgende Bedingungen:</p>
+  <ul class="legal-ul">
+    <li>Der Bot darf ausschließlich für seinen vorgesehenen Zweck genutzt werden</li>
+    <li>Versuche, den Bot zu manipulieren, zu exploiten oder Sicherheitslücken auszunutzen, sind untersagt</li>
+    <li>Virtuelle Coins und andere In-Bot-Währungen haben keinen realen Geldwert</li>
+    <li>Wir behalten uns das Recht vor, Kontostände oder Fortschritte jederzeit zurückzusetzen</li>
+    <li>Der Betrieb des Bots kann jederzeit ohne Vorankündigung eingestellt oder verändert werden</li>
+  </ul>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">4. Aktivitätstracking</h2>
+  <p class="legal-p">Der Bot erfasst Aktivitätsdaten von registrierten Mitgliedern im Twitch-Chat des Streamers. Dies dient der Anwesenheitsverfolgung und der Erstellung von Aktivitätsberichten.</p>
+  <div class="legal-box">
+    <p>Die Datenerfassung beginnt erst nach aktiver Verknüpfung des Discord-Accounts mit dem Twitch-Account über den <strong>/connect</strong>-Befehl. Eine Verknüpfung kann jederzeit mit <strong>/disconnect</strong> aufgehoben werden.</p>
+  </div>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">5. Moderationsmaßnahmen</h2>
+  <p class="legal-p">Das Moderationsteam behält sich das Recht vor, bei Verstößen gegen diese Regeln Maßnahmen zu ergreifen, darunter:</p>
+  <ul class="legal-ul">
+    <li>Verwarnungen und Hinweise</li>
+    <li>Temporäre Stummschaltung oder Timeouts</li>
+    <li>Temporäre oder permanente Ausschlüsse (Bans) vom Server</li>
+    <li>Zurücksetzen von Bot-Fortschritten oder Coin-Guthaben</li>
+  </ul>
+  <p class="legal-p">Moderationsentscheidungen liegen im Ermessen des Teams. Ein Anspruch auf Wiederzulassung besteht nicht.</p>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">6. Haftungsausschluss</h2>
+  <p class="legal-p">Die ByGorgii Community wird als privates Hobby-Projekt betrieben. Wir übernehmen keine Haftung für:</p>
+  <ul class="legal-ul">
+    <li>Datenverluste oder technische Ausfälle des Bots oder Servers</li>
+    <li>Verlust virtueller Währungen oder Fortschritte</li>
+    <li>Inhalte, die von anderen Mitgliedern geteilt werden</li>
+    <li>Ausfälle oder Änderungen der genutzten Drittdienste (Discord, Twitch etc.)</li>
+  </ul>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">7. Änderungen dieser Bedingungen</h2>
+  <p class="legal-p">Wir behalten uns vor, diese Nutzungsbedingungen jederzeit zu ändern. Wesentliche Änderungen werden im Server kommuniziert. Die fortgesetzte Nutzung nach Änderungen gilt als Zustimmung.</p>
+</div>
+
+<div class="legal-section">
+  <h2 class="legal-h2">8. Kontakt</h2>
+  <p class="legal-p">Bei Fragen zu diesen Nutzungsbedingungen wende dich per Discord-Direktnachricht an die Serveradministration oder erstelle ein Support-Ticket über den <strong>/ticket</strong>-Befehl.</p>
+</div>
+{% endblock %}
