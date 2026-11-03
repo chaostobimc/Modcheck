@@ -318,6 +318,46 @@ async def resolve_broadcaster_id() -> str | None:
     return None
 
 
+_streamer_profile_cache: dict[str, Any] = {"data": None, "fetched_at": 0.0}
+
+
+async def fetch_streamer_profile() -> dict[str, Any] | None:
+    """Lädt das Twitch-Profil des Streamers (Avatar, Anzeigename, Beschreibung) mit 6h Cache."""
+    import time as _t
+
+    now = _t.monotonic()
+    if _streamer_profile_cache["data"] and (now - _streamer_profile_cache["fetched_at"]) < 21600:
+        return _streamer_profile_cache["data"]
+    if not STREAMER_CHANNEL or not TWITCH_CLIENT_ID:
+        return None
+    token = await get_twitch_app_token()
+    if not token:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.twitch.tv/helix/users",
+                params={"login": STREAMER_CHANNEL},
+                headers={
+                    "Client-ID": TWITCH_CLIENT_ID,
+                    "Authorization": f"Bearer {token}",
+                },
+                timeout=aiohttp.ClientTimeout(total=8),
+            ) as resp:
+                if resp.status == 200:
+                    rows = (await resp.json()).get("data", [])
+                    if rows:
+                        prof = rows[0]
+                        _streamer_profile_cache["data"] = prof
+                        _streamer_profile_cache["fetched_at"] = now
+                        if prof.get("id"):
+                            _stream_live_cache["broadcaster_id"] = str(prof["id"])
+                        return prof
+    except Exception:
+        pass
+    return _streamer_profile_cache["data"]
+
+
 async def fetch_recent_clips(limit: int = 20) -> list[dict[str, Any]]:
     bid = await resolve_broadcaster_id()
     if not bid or not TWITCH_CLIENT_ID:

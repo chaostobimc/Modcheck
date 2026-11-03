@@ -13,11 +13,23 @@ from typing import Any
 
 from bot_core.config import (
     ABSENCE_FILE,
+    ALERTS_FILE,
     BANK_FILE,
     DATA_FILE,
+    INACTIVITY_WARN_CHANNEL_ID,
+    INACTIVITY_WARN_STREAMS,
+    LIVE_ANNOUNCE_CHANNEL_ID,
+    LIVE_PING_EVERYONE,
+    LIVE_PING_ROLE_ID,
+    PREFS_FILE,
     START_BALANCE,
     TICKET_DATA_FILE,
     VAULT_FILE,
+    YOUTUBE_ANNOUNCE_CHANNEL_ID,
+    YOUTUBE_CHANNEL_ID,
+    YOUTUBE_PING_EVERYONE,
+    YOUTUBE_PING_ROLE_ID,
+    today_berlin,
 )
 
 
@@ -422,3 +434,203 @@ def get_user_absences(uid: str) -> list[dict[str, str]]:
             {"date": d, "reason": reasons.get(d, "Kein Grund angegeben")}
             for d in dates
         ]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 6. USER- & SERVER-PRÄFERENZEN (user_prefs.json: Favoriten, Volume, Temp-VC)
+# ═══════════════════════════════════════════════════════════════════════════
+_prefs_lock = threading.RLock()
+_prefs_cache: dict[str, Any] | None = None
+
+
+def _get_prefs_unlocked() -> dict[str, Any]:
+    global _prefs_cache
+    if _prefs_cache is None:
+        raw = _read_json(PREFS_FILE, {})
+        if not isinstance(raw, dict):
+            raw = {}
+        raw.setdefault("favorites", {})
+        raw.setdefault("guild_volumes", {})
+        raw.setdefault("temp_voice", {})
+        _prefs_cache = raw
+    return _prefs_cache
+
+
+def _save_prefs_unlocked() -> None:
+    if _prefs_cache is not None:
+        _atomic_write_json(PREFS_FILE, _prefs_cache)
+
+
+# ── Musik-Favoriten ────────────────────────────────────────────────────────
+
+def get_user_favorites(user_id: int) -> list[dict[str, Any]]:
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        favs = prefs["favorites"].get(str(user_id), [])
+        return copy.deepcopy(favs) if isinstance(favs, list) else []
+
+
+def is_user_favorite(user_id: int, url: str) -> bool:
+    norm = (url or "").strip()
+    if not norm:
+        return False
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        favs = prefs["favorites"].get(str(user_id), [])
+        return any(isinstance(f, dict) and f.get("url") == norm for f in favs)
+
+
+def toggle_user_favorite(
+    user_id: int,
+    item: dict[str, Any],
+    max_items: int = 25,
+) -> tuple[str, int]:
+    """Fügt einen Favoriten hinzu oder entfernt ihn falls vorhanden.
+    Rückgabe: (status: 'added' | 'removed' | 'full', anzahl_gesamt).
+    """
+    url = str(item.get("url") or "").strip()
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        uid = str(user_id)
+        favs: list[dict[str, Any]] = prefs["favorites"].setdefault(uid, [])
+        for idx, existing in enumerate(favs):
+            if isinstance(existing, dict) and existing.get("url") == url and url:
+                favs.pop(idx)
+                _save_prefs_unlocked()
+                return "removed", len(favs)
+        if len(favs) >= max_items:
+            return "full", len(favs)
+        entry = {
+            "title": str(item.get("title") or "Unbekannt")[:100],
+            "url": url,
+            "duration": int(item.get("duration") or 0),
+            "thumbnail": str(item.get("thumbnail") or ""),
+            "is_radio": bool(item.get("is_radio", False)),
+            "added_at": str(today_berlin()),
+        }
+        favs.append(entry)
+        _save_prefs_unlocked()
+        return "added", len(favs)
+
+
+def remove_user_favorite(user_id: int, index: int) -> dict[str, Any] | None:
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        favs = prefs["favorites"].get(str(user_id), [])
+        if isinstance(favs, list) and 0 <= index < len(favs):
+            removed = favs.pop(index)
+            _save_prefs_unlocked()
+            return copy.deepcopy(removed)
+        return None
+
+
+# ── Musik-Lautstärke (pro Server) ──────────────────────────────────────────
+
+def get_guild_volume(guild_id: int) -> int:
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        val = int(prefs["guild_volumes"].get(str(guild_id), 100) or 100)
+        return max(5, min(200, val))
+
+
+def set_guild_volume(guild_id: int, percent: int) -> int:
+    clamped = max(5, min(200, int(percent)))
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        prefs["guild_volumes"][str(guild_id)] = clamped
+        _save_prefs_unlocked()
+    return clamped
+
+
+# ── Temp-Voice Gedächtnis (pro User) ───────────────────────────────────────
+
+def get_temp_voice_prefs(user_id: int) -> dict[str, Any]:
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        entry = prefs["temp_voice"].get(str(user_id), {})
+        return copy.deepcopy(entry) if isinstance(entry, dict) else {}
+
+
+def update_temp_voice_prefs(user_id: int, **kwargs: Any) -> dict[str, Any]:
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        uid = str(user_id)
+        entry = prefs["temp_voice"].setdefault(uid, {})
+        if not isinstance(entry, dict):
+            entry = {}
+            prefs["temp_voice"][uid] = entry
+        for k, v in kwargs.items():
+            if v is not None:
+                entry[k] = v
+        _save_prefs_unlocked()
+        return copy.deepcopy(entry)
+
+
+def clear_temp_voice_prefs(user_id: int) -> None:
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        if prefs["temp_voice"].pop(str(user_id), None) is not None:
+            _save_prefs_unlocked()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 7. ALERTS-KONFIGURATION & ZUSTAND (alerts_state.json)
+# ═══════════════════════════════════════════════════════════════════════════
+_alerts_lock = threading.RLock()
+_alerts_cache: dict[str, Any] | None = None
+
+
+def _ensure_alerts_schema(d: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(d, dict):
+        d = {}
+    cfg = d.setdefault("config", {})
+    cfg.setdefault("live_channel_id", LIVE_ANNOUNCE_CHANNEL_ID)
+    cfg.setdefault("live_ping_role_id", LIVE_PING_ROLE_ID)
+    cfg.setdefault("live_ping_everyone", LIVE_PING_EVERYONE)
+
+    cfg.setdefault("yt_channel_id_discord", YOUTUBE_ANNOUNCE_CHANNEL_ID)
+    cfg.setdefault("yt_source", YOUTUBE_CHANNEL_ID)
+    cfg.setdefault("yt_resolved_uc_id", "")
+    cfg.setdefault("yt_channel_title", "")
+    cfg.setdefault("yt_ping_role_id", YOUTUBE_PING_ROLE_ID)
+    cfg.setdefault("yt_ping_everyone", YOUTUBE_PING_EVERYONE)
+
+    cfg.setdefault("inactivity_channel_id", INACTIVITY_WARN_CHANNEL_ID)
+    cfg.setdefault("inactivity_threshold", max(1, INACTIVITY_WARN_STREAMS))
+    cfg.setdefault("inactivity_enabled", True)
+
+    tw = d.setdefault("twitch_state", {})
+    tw.setdefault("is_live", False)
+    tw.setdefault("last_stream_id", "")
+    tw.setdefault("last_announce_ts", 0.0)
+    tw.setdefault("last_offline_ts", 0.0)
+    tw.setdefault("active_message_id", 0)
+    tw.setdefault("active_channel_id", 0)
+    tw.setdefault("peak_viewers", 0)
+    tw.setdefault("games", [])
+    tw.setdefault("started_at", "")
+    tw.setdefault("title", "")
+
+    yt = d.setdefault("youtube_state", {})
+    yt.setdefault("initialized_for_uc", "")
+    yt.setdefault("seen_video_ids", [])
+
+    ina = d.setdefault("inactivity_state", {})
+    ina.setdefault("warned_streaks", {})
+    return d
+
+
+def load_alerts_state() -> dict[str, Any]:
+    global _alerts_cache
+    with _alerts_lock:
+        if _alerts_cache is None:
+            _alerts_cache = _ensure_alerts_schema(_read_json(ALERTS_FILE, {}))
+        return copy.deepcopy(_alerts_cache)
+
+
+def save_alerts_state(data: dict[str, Any]) -> None:
+    global _alerts_cache
+    with _alerts_lock:
+        _alerts_cache = _ensure_alerts_schema(copy.deepcopy(data))
+        _atomic_write_json(ALERTS_FILE, _alerts_cache)
+

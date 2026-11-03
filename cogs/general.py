@@ -48,6 +48,7 @@ from bot_core.storage import (
     get_balance,
     get_fishing_data,
     get_job_data,
+    load_alerts_state,
     load_bank,
     load_data,
     open_tickets,
@@ -102,17 +103,18 @@ def _build_help_embed(category: str) -> discord.Embed:
 
     if category == "music":
         embed = discord.Embed(
-            title="🎵 Musik-Bot & 📻 Live-Radio",
-            description="YouTube, Playlists, Spotify-Links & Tausende Radiosender.",
+            title="🎵 Musik-Bot, ⭐ Favoriten & 📻 Live-Radio",
+            description="YouTube, Playlists, Spotify-Links, Favoriten, Live-Lautstärke & Radiosender.",
             color=0x1DB954,
             timestamp=now,
         )
         embed.add_field(
-            name="🎶 Musik-Player",
+            name="🎶 Musik-Player & Lautstärke",
             value=(
                 "`/play <song/URL>` — YouTube- oder Spotify-Track/-Playlist abspielen\n"
                 "`/search <titel>` — Top-10 Ergebnisse durchsuchen & auswählen\n"
-                "`/nowplaying` — Aktueller Song + interaktive Player-Buttons\n"
+                "`/nowplaying` — Aktueller Song + interaktive Player-Buttons (`🔉`/`🔊`/`⭐`)\n"
+                "`/volume [5–200]` — Lautstärke live anpassen oder anzeigen (wird gemerkt)\n"
                 "`/queue` — Warteschlange mit Seitennavigation\n"
                 "`/skip` — Aktuellen Song überspringen\n"
                 "`/shuffle` — Warteschlange mischen\n"
@@ -122,11 +124,46 @@ def _build_help_embed(category: str) -> discord.Embed:
             inline=False,
         )
         embed.add_field(
+            name="⭐ Persönliche Favoriten",
+            value=(
+                "`/fav` — Gespeicherte Songs & Radiosender öffnen, abspielen oder mischen\n"
+                "`/favadd [song/URL]` — Aktuellen Song oder Suche direkt als Favorit speichern\n"
+                "💡 *Oder direkt unter „Jetzt spielt“ auf den **`⭐ Favorit`**-Button klicken!*"
+            ),
+            inline=False,
+        )
+        embed.add_field(
             name="📻 Radio",
             value=(
                 "`/radio` — Aus beliebten Preset-Sendern wählen\n"
                 "`/radio <sender>` — Weltweit nach Radiosendern/Genres suchen\n"
                 "`/stations` — Alle Preset-Sender im Überblick"
+            ),
+            inline=False,
+        )
+        return embed
+
+    if category == "alerts":
+        embed = discord.Embed(
+            title="🔔 Twitch Live-, YouTube- & Inaktivitäts-Alerts",
+            description="Vollautomatische Ankündigungen & Team-Frühwarnsystem (ohne externe API-Zusatzkosten).",
+            color=0x9146FF,
+            timestamp=now,
+        )
+        embed.add_field(
+            name="🟣 Twitch & 🔴 YouTube Auto-Posts",
+            value=(
+                "`/alerts` — Aktuellen Status aller Benachrichtigungen anzeigen\n"
+                "`/setlivealert [kanal] [ping_rolle] [ping_everyone]` — Automatischer „JETZT LIVE“-Post (inkl. Live-Update & Offline-Zusammenfassung)\n"
+                "`/setyoutubealert [kanal] [youtube_kanal] [ping_rolle] [ping_everyone]` — Automatische Posts bei neuen YouTube-Videos & Shorts\n"
+                "`/testalert <typ>` — Sofort-Vorschau für Twitch, YouTube oder Inaktivität"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="⚠️ Unentschuldigte Mod-Inaktivität",
+            value=(
+                "`/setinactivity [streams_in_folge] [kanal] [aktiv]` — Warnt Admins automatisch, wenn ein Mod z. B. **5 Streams in Folge** ohne `/absent` verpasst."
             ),
             inline=False,
         )
@@ -237,10 +274,10 @@ def _build_help_embed(category: str) -> discord.Embed:
             inline=False,
         )
         embed.add_field(
-            name="🎙️ Temp-Voice",
+            name="🎙️ Temp-Voice (mit Gedächtnis 💾)",
             value=(
                 "Tritt dem **Erstell-Kanal** bei, um automatisch einen eigenen Sprach- & Textkanal zu erhalten.\n"
-                "Über das Panel kannst du Name, Limit, Bitrate, Sperre, Einladungen, Kicks & Admin-Rechte steuern."
+                "Name, Nutzer-Limit & Bitrate werden **automatisch für zukünftige Kanäle gemerkt** (per `♻️ Standard` jederzeit rücksetzbar)."
             ),
             inline=False,
         )
@@ -272,8 +309,13 @@ def _build_help_embed(category: str) -> discord.Embed:
         inline=True,
     )
     embed.add_field(
-        name="🎵 Musik & Radio",
-        value="YouTube, Spotify-Support, Autoplay & Live-Radiosender",
+        name="🔔 Live- & YT-Alerts",
+        value="Auto-Posts für Twitch & YouTube + Inaktivitäts-Frühwarnung",
+        inline=True,
+    )
+    embed.add_field(
+        name="🎵 Musik & Favoriten",
+        value="YouTube, Spotify, ⭐ Favoriten, 🔊 Lautstärke & Live-Radio",
         inline=True,
     )
     embed.add_field(
@@ -288,15 +330,10 @@ def _build_help_embed(category: str) -> discord.Embed:
     )
     embed.add_field(
         name="🎫 Tickets & Voice",
-        value="Support-Tickets mit Transcript & dynamische Temp-Voice-Räume",
+        value="Support-Tickets mit Transcript & Temp-Voice mit Gedächtnis",
         inline=True,
     )
-    embed.add_field(
-        name="🌐 Web-Dashboard",
-        value="Öffentlicher Community-Hub & Echtzeit-Admin-Panel",
-        inline=True,
-    )
-    embed.set_footer(text="Wähle unten eine Kategorie für alle Befehle • Modcheck v2.0")
+    embed.set_footer(text="Wähle unten eine Kategorie für alle Befehle • Modcheck v2.2")
     return embed
 
 
@@ -310,7 +347,8 @@ class HelpCategoryView(discord.ui.View):
         options=[
             discord.SelectOption(label="Übersicht", value="overview", emoji="🏠", description="Startseite aller Module"),
             discord.SelectOption(label="Activity & Twitch", value="activity", emoji="📊", description="Streaks, Berichte & Abwesenheiten"),
-            discord.SelectOption(label="Musik & Radio", value="music", emoji="🎵", description="YouTube, Spotify & Radiosender"),
+            discord.SelectOption(label="Live-, YouTube- & Mod-Alerts", value="alerts", emoji="🔔", description="Automatische Ankündigungen & Warnungen"),
+            discord.SelectOption(label="Musik, Favoriten & Radio", value="music", emoji="🎵", description="Player, Favoriten, Lautstärke & Radio"),
             discord.SelectOption(label="Casino & Multiplayer", value="casino", emoji="🎰", description="Economy, Solo-Games & PvP"),
             discord.SelectOption(label="Angeln, Jobs & Shop", value="jobs", emoji="🎣", description="Berufe, Upgrades & Kanalpunkte"),
             discord.SelectOption(label="Tickets, Temp-Voice & Tools", value="community", emoji="🎫", description="Support, Sprachkanäle, Profile & Reminder"),
@@ -544,6 +582,7 @@ class GeneralCog(commands.Cog, name="General"):
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024.0
         ping_ms = round(self.bot.latency * 1000)
         is_live = is_stream_currently_live_cached()
+        alerts_cfg = load_alerts_state().get("config", {})
 
         embed = discord.Embed(
             title="🤖 Modcheck System-Status",
@@ -555,6 +594,9 @@ class GeneralCog(commands.Cog, name="General"):
             value=(
                 f"Discord Gateway ─ ✅ Online (`{ping_ms} ms`)\n"
                 f"Twitch Tracker ── {'🟢 LIVE' if is_live else ('✅ Bereit' if STREAMER_CHANNEL else '❌ Deaktiviert')}\n"
+                f"Twitch Live-Post  {'✅ Aktiv' if alerts_cfg.get('live_channel_id') else '❌ Nicht gesetzt (/setlivealert)'}\n"
+                f"YouTube-Alerts ── {'✅ Aktiv' if alerts_cfg.get('yt_channel_id_discord') else '❌ Nicht gesetzt (/setyoutubealert)'}\n"
+                f"Inaktivitäts-Warn {'✅ Aktiv (ab ' + str(alerts_cfg.get('inactivity_threshold', 5)) + ' Streams)' if alerts_cfg.get('inactivity_enabled', True) else '⏸️ Pausiert'}\n"
                 f"Twitch Mod Log ── {'✅ Aktiv' if TWITCH_LOG_CHANNEL_ID else '❌ Deaktiviert'}\n"
                 f"Musik & Radio ─── {'✅ Aktiv (' + str(active_music) + ' Streams)' if MUSIC_ENABLED else '❌ Deaktiviert'}\n"
                 f"Temp Voice ────── {'✅ Aktiv (' + str(active_tempvcs) + ' Kanäle)' if TEMP_VOICE_CHANNEL_ID else '❌ Deaktiviert'}\n"

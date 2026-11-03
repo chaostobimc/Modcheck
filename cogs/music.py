@@ -16,6 +16,7 @@ from discord.ext import commands, tasks
 from bot_core.config import (
     BASE_DIR,
     COLOR_ERROR,
+    COLOR_GOLD,
     COLOR_MUSIC,
     COLOR_RADIO,
     COLOR_SPOTIFY,
@@ -27,6 +28,13 @@ from bot_core.config import (
     YOUTUBE_COOKIES_FILE,
     YOUTUBE_POT_PROVIDER_URL,
     runtime_settings,
+)
+from bot_core.storage import (
+    get_guild_volume,
+    get_user_favorites,
+    remove_user_favorite,
+    set_guild_volume,
+    toggle_user_favorite,
 )
 
 try:
@@ -193,6 +201,7 @@ class GuildMusicState:
         self.last_np_message: discord.Message | None = None
         self.autoplay: bool = False
         self.loop_mode: str = "off"  # "off" | "track" | "queue"
+        self.volume_pct: int = get_guild_volume(guild_id)
         self.history: deque[str] = deque(maxlen=15)
         self.is_loading: bool = False
         self._idle_seconds: int = 0
@@ -200,6 +209,18 @@ class GuildMusicState:
         self._stale_current_seconds: int = 0
         self._lock = asyncio.Lock()
         self.consecutive_failures: int = 0
+
+    def set_volume(self, pct: int) -> int:
+        """Setzt die Lautstärke live (5%–200%) und speichert sie dauerhaft für diesen Server."""
+        self.volume_pct = set_guild_volume(self.guild_id, pct)
+        guild = self.bot.get_guild(self.guild_id)
+        vc = self.voice_client or (guild.voice_client if guild else None)
+        if vc is not None and getattr(vc, "source", None) is not None and hasattr(vc.source, "volume"):
+            try:
+                vc.source.volume = self.volume_pct / 100.0
+            except Exception:
+                pass
+        return self.volume_pct
 
     async def restore_default_presence(self) -> None:
         try:
@@ -551,6 +572,35 @@ async def search_radio_stations_list(query: str, limit: int = 10) -> list[dict[s
 
 # ── Playback Engine ────────────────────────────────────────────────────────
 
+def _make_volume_bar(pct: int) -> str:
+    icon = "🔇" if pct <= 10 else "🔉" if pct < 75 else "🔊"
+    ratio = min(max(pct / 100.0, 0.0), 1.0)
+    filled = round(ratio * 10)
+    bar = "█" * filled + "░" * (10 - filled)
+    boost = " `⚡BOOST`" if pct > 100 else ""
+    return f"{icon} `{bar}` **{pct}%**{boost}"
+
+
+def _create_audio_source(
+    stream_url: str,
+    base_ffmpeg_opts: dict[str, str],
+    volume_pct: int,
+) -> discord.AudioSource:
+    vol_float = max(0.05, min(2.0, volume_pct / 100.0))
+    raw = discord.FFmpegPCMAudio(stream_url, **base_ffmpeg_opts)
+    if hasattr(discord, "PCMVolumeTransformer"):
+        try:
+            return discord.PCMVolumeTransformer(raw, volume=vol_float)
+        except Exception:
+            pass
+    # Fallback über FFmpeg-Filter falls PCMVolumeTransformer auf einer Plattform nicht verfügbar ist
+    fallback_opts = {
+        "before_options": base_ffmpeg_opts.get("before_options", ""),
+        "options": f"{base_ffmpeg_opts.get('options', '-vn')} -filter:a volume={vol_float:.2f}".strip(),
+    }
+    return discord.FFmpegPCMAudio(stream_url, **fallback_opts)
+
+
 async def _play_song_robust(
     state: GuildMusicState, song: SongInfo, after_cb
 ) -> bool:
@@ -559,7 +609,7 @@ async def _play_song_robust(
 
     if song.is_radio and song.url:
         try:
-            source = discord.FFmpegPCMAudio(song.url, **RADIO_FFMPEG_OPTIONS)
+            source = _create_audio_source(song.url, RADIO_FFMPEG_OPTIONS, state.volume_pct)
             state.voice_client.play(source, after=after_cb)
             await asyncio.sleep(1.5)
             return state.voice_client.is_playing() or state.voice_client.is_paused()
@@ -598,7 +648,7 @@ async def _play_song_robust(
             after_cb(err)
 
         try:
-            source = discord.FFmpegPCMAudio(stream_url, **FFMPEG_OPTIONS)
+            source = _create_audio_source(stream_url, FFMPEG_OPTIONS, state.volume_pct)
             state.voice_client.play(source, after=_wrapped_after)
         except Exception:
             continue
@@ -751,14 +801,14 @@ def build_now_playing_embed(state: GuildMusicState) -> discord.Embed:
     status_str = "⏸️ Pausiert" if (state.voice_client and state.voice_client.is_paused()) else "▶️ Spielt"
     embed.set_footer(
         text=(
-            f"{status_str} • Loop: {loop_labels.get(state.loop_mode, 'Aus')} • "
+            f"{status_str} • 🔊 {state.volume_pct}% • Loop: {loop_labels.get(state.loop_mode, 'Aus')} • "
             f"Autoplay: {'✅ An' if state.autoplay else '❌ Aus'}"
         )
     )
     return embed
 
 
-# ── Discord UI Views (Player Controls, Queue Pagination, Search, Radio) ───
+# ── Discord UI Views (Player Controls, Queue Pagination, Search, Radio, Favoriten) ───
 
 class MusicPlayerControlView(discord.ui.View):
     def __init__(self, state: GuildMusicState) -> None:
@@ -791,6 +841,7 @@ class MusicPlayerControlView(discord.ui.View):
         self.btn_loop.label = lbl
         self.btn_loop.style = st
 
+        self.btn_vol_up.label = f"{self.state.volume_pct}% +"
         self.btn_autoplay.label = "Autoplay: An" if self.state.autoplay else "Autoplay: Aus"
         self.btn_autoplay.style = (
             discord.ButtonStyle.success if self.state.autoplay else discord.ButtonStyle.secondary
@@ -858,15 +909,7 @@ class MusicPlayerControlView(discord.ui.View):
             f"🔀 **{len(qlist)}** Songs wurden gemischt!", ephemeral=True, delete_after=5
         )
 
-    @discord.ui.button(label="Autoplay: Aus", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
-    async def btn_autoplay(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        if not await self._check_vc(interaction):
-            return
-        self.state.autoplay = not self.state.autoplay
-        self._sync_labels()
-        await interaction.response.edit_message(embed=build_now_playing_embed(self.state), view=self)
-
-    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=1)
+    @discord.ui.button(label="Stop", emoji="⏹️", style=discord.ButtonStyle.danger, row=0)
     async def btn_stop(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check_vc(interaction):
             return
@@ -880,6 +923,66 @@ class MusicPlayerControlView(discord.ui.View):
             ),
             view=None,
         )
+
+    @discord.ui.button(label="-", emoji="🔉", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_vol_down(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check_vc(interaction):
+            return
+        self.state.set_volume(self.state.volume_pct - 15)
+        self._sync_labels()
+        await interaction.response.edit_message(embed=build_now_playing_embed(self.state), view=self)
+
+    @discord.ui.button(label="100% +", emoji="🔊", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_vol_up(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check_vc(interaction):
+            return
+        self.state.set_volume(self.state.volume_pct + 15)
+        self._sync_labels()
+        await interaction.response.edit_message(embed=build_now_playing_embed(self.state), view=self)
+
+    @discord.ui.button(label="Favorit", emoji="⭐", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_favorite(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        song = self.state.current
+        if not song:
+            await interaction.response.send_message("❌ Es läuft gerade kein Song.", ephemeral=True)
+            return
+        fav_url = song.url if song.is_radio else (song.webpage_url or song.url)
+        if not fav_url:
+            await interaction.response.send_message("❌ Dieser Stream hat keine speicherbare URL.", ephemeral=True)
+            return
+        status, total = toggle_user_favorite(
+            interaction.user.id,
+            {
+                "title": song.title,
+                "url": fav_url,
+                "duration": song.duration,
+                "thumbnail": song.thumbnail,
+                "is_radio": song.is_radio,
+            },
+        )
+        if status == "added":
+            await interaction.response.send_message(
+                f"⭐ **{song.title}** wurde zu deinen Favoriten hinzugefügt! (`{total}/25` • `/fav`)",
+                ephemeral=True,
+            )
+        elif status == "removed":
+            await interaction.response.send_message(
+                f"🗑️ **{song.title}** wurde aus deinen Favoriten entfernt. (`{total}/25`)",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "❌ Deine Favoritenliste ist voll (`25/25`). Nutze `/fav`, um alte Einträge zu löschen.",
+                ephemeral=True,
+            )
+
+    @discord.ui.button(label="Autoplay: Aus", emoji="🔄", style=discord.ButtonStyle.secondary, row=1)
+    async def btn_autoplay(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        if not await self._check_vc(interaction):
+            return
+        self.state.autoplay = not self.state.autoplay
+        self._sync_labels()
+        await interaction.response.edit_message(embed=build_now_playing_embed(self.state), view=self)
 
 
 class QueuePaginationView(discord.ui.View):
@@ -1625,7 +1728,7 @@ class MusicCog(commands.Cog, name="Music"):
         )
 
     @app_commands.command(name="stations", description="📻 Zeigt alle Preset-Radiosender")
-    async def cmd_stations(self, interaction: discord.Interaction) -> None:
+    async def cmd_stations(self, interaction: discord.Interaction, ) -> None:
         lines = [
             f"{s['emoji']} **{s['name']}**\n╰ {s['description']}"
             for s in RADIO_STATIONS.values()
@@ -1645,6 +1748,442 @@ class MusicCog(commands.Cog, name="Music"):
             inline=False,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
+
+    # ── Slash Commands: Lautstärke & Favoriten ────────────────────────────
+
+    @app_commands.command(
+        name="volume",
+        description="🔊 Ändert die Musik-Lautstärke live (5% – 200%) oder zeigt sie an",
+    )
+    @app_commands.describe(prozent="Gewünschte Lautstärke in Prozent (5–200, Standard: 100)")
+    async def cmd_volume(
+        self,
+        interaction: discord.Interaction,
+        prozent: app_commands.Range[int, 5, 200] | None = None,
+    ) -> None:
+        state = get_music_state(interaction.guild_id, self.bot)
+        if prozent is None:
+            embed = discord.Embed(
+                title="🔊 Aktuelle Lautstärke",
+                description=_make_volume_bar(state.volume_pct),
+                color=COLOR_MUSIC,
+            )
+            embed.set_footer(text="Tipp: /volume <5–200> zum Anpassen • Einstellung wird gespeichert")
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+
+        if state.voice_client and state.voice_client.is_connected():
+            is_in_same_vc = (
+                isinstance(interaction.user, discord.Member)
+                and interaction.user.voice
+                and interaction.user.voice.channel == state.voice_client.channel
+            )
+            is_admin = isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator
+            if not is_in_same_vc and not is_admin:
+                await interaction.response.send_message(
+                    "❌ Du musst im selben Voice-Kanal sein, um die Lautstärke während der Wiedergabe zu ändern!",
+                    ephemeral=True,
+                )
+                return
+
+        new_pct = state.set_volume(prozent)
+        if state.last_np_message is not None and state.current is not None:
+            try:
+                await state.last_np_message.edit(
+                    embed=build_now_playing_embed(state),
+                    view=MusicPlayerControlView(state),
+                )
+            except Exception:
+                pass
+
+        embed = discord.Embed(
+            title="🔊 Lautstärke angepasst",
+            description=_make_volume_bar(new_pct),
+            color=COLOR_MUSIC,
+        )
+        embed.set_footer(text=f"Gesetzt von {interaction.user.display_name} • Für diesen Server gemerkt")
+        await interaction.response.send_message(embed=embed, delete_after=10)
+
+    @app_commands.command(
+        name="fav",
+        description="⭐ Öffnet deine persönlichen Musik- & Radio-Favoriten zum direkten Abspielen",
+    )
+    async def cmd_fav(self, interaction: discord.Interaction) -> None:
+        favs = get_user_favorites(interaction.user.id)
+        view = FavoritesView(interaction.user, self.bot, favs)
+        await interaction.response.send_message(
+            embed=view.build_embed(),
+            view=view,
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="favadd",
+        description="⭐ Speichert den aktuellen Song oder eine Suche/URL in deinen Favoriten",
+    )
+    @app_commands.describe(query="Optional: Songtitel, YouTube- oder Spotify-URL (leer = aktueller Song)")
+    async def cmd_favadd(
+        self,
+        interaction: discord.Interaction,
+        query: str | None = None,
+    ) -> None:
+        # 1) Ohne Query: aktuell laufenden Song / Radiosender speichern
+        if not query or not query.strip():
+            state = get_music_state(interaction.guild_id, self.bot)
+            song = state.current
+            if not song:
+                await interaction.response.send_message(
+                    "❌ Es läuft gerade kein Song! Übergib alternativ einen Titel/Link: `/favadd <song>`.",
+                    ephemeral=True,
+                )
+                return
+            fav_url = song.url if song.is_radio else (song.webpage_url or song.url)
+            status, total = toggle_user_favorite(
+                interaction.user.id,
+                {
+                    "title": song.title,
+                    "url": fav_url,
+                    "duration": song.duration,
+                    "thumbnail": song.thumbnail,
+                    "is_radio": song.is_radio,
+                },
+            )
+            if status == "added":
+                await interaction.response.send_message(
+                    f"⭐ **{song.title}** zu deinen Favoriten hinzugefügt! (`{total}/25` • `/fav`)",
+                    ephemeral=True,
+                )
+            elif status == "removed":
+                await interaction.response.send_message(
+                    f"🗑️ **{song.title}** war bereits gespeichert und wurde entfernt (`{total}/25`).",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.response.send_message(
+                    "❌ Deine Favoritenliste ist voll (`25/25`). Öffne `/fav` zum Verwalten.",
+                    ephemeral=True,
+                )
+            return
+
+        # 2) Mit Query: auf Spotify / YouTube suchen und direkt speichern
+        await interaction.response.defer(ephemeral=True)
+        q = query.strip()
+        title = ""
+        url = ""
+        dur = 0
+        thumb = ""
+
+        if is_spotify_url(q):
+            sp_tracks = await fetch_spotify_tracks(q)
+            if sp_tracks:
+                sp = sp_tracks[0]
+                res = await search_tracks(sp["search_query"], limit=1)
+                if res:
+                    e0 = res[0]
+                    title = sp["title"]
+                    url = _get_reference_url(e0)
+                    dur = sp.get("duration") or int(e0.get("duration") or 0)
+                    thumb = sp.get("thumbnail") or _entry_thumbnail(e0)
+        else:
+            res = await search_tracks(q, limit=1)
+            if res:
+                e0 = res[0]
+                title = e0.get("title", "Unbekannt")
+                url = _get_reference_url(e0, q)
+                dur = int(e0.get("duration") or 0)
+                thumb = _entry_thumbnail(e0)
+
+        if not url:
+            await interaction.followup.send(f"❌ Konnte keinen Song für `{q}` finden.", ephemeral=True)
+            return
+
+        from bot_core.storage import is_user_favorite
+        if is_user_favorite(interaction.user.id, url):
+            await interaction.followup.send(
+                f"ℹ️ **{title}** befindet sich bereits in deinen Favoriten (`/fav`).",
+                ephemeral=True,
+            )
+            return
+
+        status, total = toggle_user_favorite(
+            interaction.user.id,
+            {"title": title, "url": url, "duration": dur, "thumbnail": thumb, "is_radio": False},
+        )
+        if status == "full":
+            await interaction.followup.send(
+                "❌ Deine Favoritenliste ist voll (`25/25`). Öffne `/fav`, um Platz zu schaffen.",
+                ephemeral=True,
+            )
+            return
+
+        embed = discord.Embed(
+            title="⭐ Favorit gespeichert!",
+            description=f"[{title}]({url})",
+            color=COLOR_GOLD,
+        )
+        m, s = divmod(dur, 60)
+        embed.add_field(name="⏱️ Dauer", value=f"{m}:{s:02d}" if dur > 0 else "Live", inline=True)
+        embed.add_field(name="📚 Gespeichert", value=f"`{total}/25`", inline=True)
+        if thumb:
+            embed.set_thumbnail(url=thumb)
+        embed.set_footer(text="Nutze /fav zum Abspielen deiner gesamten Liste")
+        await interaction.followup.send(embed=embed, ephemeral=True)
+
+
+class FavoritesView(discord.ui.View):
+    """Interaktives Favoriten-Panel: Einzelwahl, Alle abspielen, Shuffle & Löschen."""
+
+    def __init__(
+        self,
+        user: discord.abc.User,
+        bot: commands.Bot,
+        favs: list[dict[str, Any]],
+        delete_mode: bool = False,
+    ) -> None:
+        super().__init__(timeout=180)
+        self.user = user
+        self.bot = bot
+        self.favs = favs
+        self.delete_mode = delete_mode
+        self._rebuild_items()
+
+    @staticmethod
+    def _fmt_dur(dur: int, is_radio: bool) -> str:
+        if is_radio or dur <= 0:
+            return "📻 LIVE"
+        m, s = divmod(int(dur), 60)
+        h, m = divmod(m, 60)
+        return f"{h}:{m:02d}:{s:02d}" if h > 0 else f"{m}:{s:02d}"
+
+    def build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title=f"⭐ Musik-Favoriten – {self.user.display_name}",
+            color=COLOR_ERROR if self.delete_mode else COLOR_GOLD,
+        )
+        if not self.favs:
+            embed.description = (
+                "*Du hast noch keine Favoriten gespeichert.*\n\n"
+                "💡 **So speicherst du Songs & Radiosender:**\n"
+                "• Klicke beim Abspielen unter *Jetzt spielt* auf **`⭐ Favorit`**\n"
+                "• Oder nutze jederzeit **`/favadd [Song / Link]`**"
+            )
+            embed.set_footer(text="0/25 Plätze belegt")
+            return embed
+
+        mode_hint = (
+            "🗑️ **Lösch-Modus aktiv:** Wähle unten einen Eintrag aus, um ihn zu entfernen.\n\n"
+            if self.delete_mode
+            else ""
+        )
+        lines = []
+        for idx, f in enumerate(self.favs[:25], 1):
+            icon = "📻" if f.get("is_radio") else "🎵"
+            dur_s = self._fmt_dur(int(f.get("duration") or 0), bool(f.get("is_radio")))
+            title = f.get("title", "Unbekannt")
+            url = f.get("url", "")
+            link_str = f"[{title}]({url})" if url.startswith("http") and not f.get("is_radio") else f"**{title}**"
+            lines.append(f"`{idx:02d}.` {icon} {link_str} — `{dur_s}`")
+
+        embed.description = (mode_hint + "\n".join(lines))[:4000]
+        embed.set_footer(text=f"{len(self.favs)}/25 Favoriten gespeichert • Klicke unten zum Abspielen")
+        return embed
+
+    def _rebuild_items(self) -> None:
+        self.clear_items()
+        if not self.favs:
+            return
+
+        options = []
+        for idx, f in enumerate(self.favs[:25]):
+            dur_s = self._fmt_dur(int(f.get("duration") or 0), bool(f.get("is_radio")))
+            emoji = "🗑️" if self.delete_mode else ("📻" if f.get("is_radio") else "🎵")
+            options.append(
+                discord.SelectOption(
+                    label=f"{idx + 1}. {str(f.get('title', 'Unbekannt'))[:85]}",
+                    description=dur_s,
+                    emoji=emoji,
+                    value=str(idx),
+                )
+            )
+
+        placeholder = (
+            "🗑️ Favorit zum Löschen auswählen..."
+            if self.delete_mode
+            else "🎵 Favorit auswählen & abspielen..."
+        )
+        picker = discord.ui.Select(placeholder=placeholder, options=options, row=0)
+        picker.callback = self._on_select
+        self.add_item(picker)
+
+        btn_all = discord.ui.Button(
+            label="Alle in Queue",
+            emoji="▶️",
+            style=discord.ButtonStyle.success,
+            disabled=self.delete_mode,
+            row=1,
+        )
+        btn_all.callback = self._on_play_all
+        self.add_item(btn_all)
+
+        btn_shuf = discord.ui.Button(
+            label="Gemischt starten",
+            emoji="🔀",
+            style=discord.ButtonStyle.primary,
+            disabled=self.delete_mode or len(self.favs) < 2,
+            row=1,
+        )
+        btn_shuf.callback = self._on_shuffle_all
+        self.add_item(btn_shuf)
+
+        btn_del = discord.ui.Button(
+            label="Abbrechen" if self.delete_mode else "Verwalten / Löschen",
+            emoji="↩️" if self.delete_mode else "🗑️",
+            style=discord.ButtonStyle.secondary if self.delete_mode else discord.ButtonStyle.danger,
+            row=1,
+        )
+        btn_del.callback = self._on_toggle_delete
+        self.add_item(btn_del)
+
+    async def _guard(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id != self.user.id:
+            await interaction.response.send_message("❌ Nicht deine Favoritenliste!", ephemeral=True)
+            return False
+        return True
+
+    async def _on_toggle_delete(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        self.delete_mode = not self.delete_mode
+        self._rebuild_items()
+        await interaction.response.edit_message(embed=self.build_embed(), view=self)
+
+    async def _on_select(self, interaction: discord.Interaction) -> None:
+        if not await self._guard(interaction):
+            return
+        idx = int(interaction.data["values"][0])  # type: ignore[index]
+        if self.delete_mode:
+            removed = remove_user_favorite(self.user.id, idx)
+            self.favs = get_user_favorites(self.user.id)
+            if not self.favs:
+                self.delete_mode = False
+            self._rebuild_items()
+            await interaction.response.edit_message(embed=self.build_embed(), view=self)
+            if removed:
+                await interaction.followup.send(
+                    f"🗑️ **{removed.get('title', 'Eintrag')}** wurde entfernt.",
+                    ephemeral=True,
+                )
+            return
+
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("❌ Du musst in einem Voice-Kanal sein!", ephemeral=True)
+            return
+        if idx < 0 or idx >= len(self.favs):
+            await interaction.response.send_message("❌ Ungültiger Eintrag.", ephemeral=True)
+            return
+
+        chosen = self.favs[idx]
+        state = get_music_state(interaction.guild_id, self.bot)
+
+        if chosen.get("is_radio"):
+            await interaction.response.defer(ephemeral=True)
+            station = {
+                "name": str(chosen.get("title", "Radio")).removeprefix("📻 ").strip(),
+                "url": chosen["url"],
+                "favicon": chosen.get("thumbnail", ""),
+            }
+            await start_radio_stream(interaction, station, state)
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        try:
+            await ensure_voice_connected(state, interaction.user.voice.channel)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Konnte Voice-Kanal nicht beitreten: {e}", ephemeral=True)
+            return
+
+        if state.current and state.current.is_radio:
+            state.current = None
+            if state.voice_client:
+                state.voice_client.stop()
+            await asyncio.sleep(0.2)
+
+        song = SongInfo(
+            title=chosen.get("title", "Unbekannt"),
+            url="",
+            webpage_url=chosen["url"],
+            duration=int(chosen.get("duration") or 0),
+            thumbnail=chosen.get("thumbnail", ""),
+            requester=interaction.user,
+        )
+        state.queue.append(song)
+        if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
+            await play_next(state, interaction.channel)
+            await interaction.followup.send(f"▶️ Starte Favorit: **{song.title}**", ephemeral=True)
+        else:
+            await interaction.followup.send(
+                f"➕ Favorit **{song.title}** auf Position `#{len(state.queue)}` eingereiht!",
+                ephemeral=True,
+            )
+
+    async def _enqueue_all(self, interaction: discord.Interaction, shuffle: bool) -> None:
+        if not await self._guard(interaction):
+            return
+        if not isinstance(interaction.user, discord.Member) or not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("❌ Du musst in einem Voice-Kanal sein!", ephemeral=True)
+            return
+
+        tracks = [f for f in self.favs if not f.get("is_radio") and f.get("url")]
+        if not tracks:
+            await interaction.response.send_message(
+                "❌ Keine normalen Musik-Tracks in deinen Favoriten (Radiosender bitte einzeln auswählen).",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+        state = get_music_state(interaction.guild_id, self.bot)
+        try:
+            await ensure_voice_connected(state, interaction.user.voice.channel)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Konnte Voice-Kanal nicht beitreten: {e}", ephemeral=True)
+            return
+
+        if state.current and state.current.is_radio:
+            state.current = None
+            if state.voice_client:
+                state.voice_client.stop()
+            await asyncio.sleep(0.2)
+
+        if shuffle:
+            random.shuffle(tracks)
+
+        for t in tracks:
+            state.queue.append(
+                SongInfo(
+                    title=t.get("title", "Unbekannt"),
+                    url="",
+                    webpage_url=t["url"],
+                    duration=int(t.get("duration") or 0),
+                    thumbnail=t.get("thumbnail", ""),
+                    requester=interaction.user,
+                )
+            )
+
+        if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
+            await play_next(state, interaction.channel)
+
+        mode_txt = "gemischt " if shuffle else ""
+        await interaction.followup.send(
+            f"⭐ **{len(tracks)}** Favoriten wurden {mode_txt}zur Warteschlange hinzugefügt!",
+            ephemeral=True,
+        )
+
+    async def _on_play_all(self, interaction: discord.Interaction) -> None:
+        await self._enqueue_all(interaction, shuffle=False)
+
+    async def _on_shuffle_all(self, interaction: discord.Interaction) -> None:
+        await self._enqueue_all(interaction, shuffle=True)
 
 
 async def setup(bot: commands.Bot) -> None:

@@ -16,6 +16,11 @@ from bot_core.config import (
     TEMP_VOICE_CHANNEL_ID,
 )
 from bot_core.stats import stats_tracker
+from bot_core.storage import (
+    clear_temp_voice_prefs,
+    get_temp_voice_prefs,
+    update_temp_voice_prefs,
+)
 
 temp_voice_channels: dict[int, dict[str, Any]] = {}
 _owner_recovery: dict[int, dict[str, Any]] = {}
@@ -105,6 +110,9 @@ def build_vc_control_embed(guild: discord.Guild, voice_channel_id: int) -> disco
         color=COLOR_VOICE,
         timestamp=datetime.datetime.now(datetime.timezone.utc),
     )
+    saved_prefs = get_temp_voice_prefs(owner_id) if owner_id else {}
+    memory_str = "Gespeichert ✅" if saved_prefs else "Automatik 💾"
+
     embed.add_field(name="📛 Kanalname", value=f"`{channel_name}`", inline=False)
     embed.add_field(name="👑 Admin", value=owner_str, inline=True)
     embed.add_field(name="🔒 Status", value="Gesperrt 🔒" if locked else "Offen 🔓", inline=True)
@@ -115,9 +123,9 @@ def build_vc_control_embed(guild: discord.Guild, voice_channel_id: int) -> disco
         value=f"`{len(allowed_users)}` User" if allowed_users else "Nicht aktiv",
         inline=True,
     )
-    embed.add_field(name="\u200b", value="\u200b", inline=True)
+    embed.add_field(name="💾 Gedächtnis", value=memory_str, inline=True)
     embed.add_field(name="🧑‍🤝‍🧑 Im Kanal", value=member_list, inline=False)
-    embed.set_footer(text="Temp Voice System • Wird gelöscht wenn alle raus sind")
+    embed.set_footer(text="Temp Voice System • Einstellungen werden automatisch gemerkt")
     return embed
 
 
@@ -162,15 +170,18 @@ class RenameChannelModal(discord.ui.Modal, title="Kanal umbenennen"):
         if not isinstance(vc, discord.VoiceChannel):
             await interaction.response.send_message("❌ Kanal nicht gefunden.", ephemeral=True)
             return
+        clean_name = self.new_name.value.strip()
         try:
-            await vc.edit(name=self.new_name.value)
+            await vc.edit(name=clean_name)
+            update_temp_voice_prefs(interaction.user.id, name=clean_name)
             vc_data = temp_voice_channels.get(self.voice_channel_id)
             if vc_data:
                 tc = interaction.guild.get_channel(vc_data.get("text_channel_id", 0))
                 if isinstance(tc, discord.TextChannel):
-                    await tc.edit(name=f"💬{_slugify_channel_name(self.new_name.value)}")
+                    await tc.edit(name=f"💬{_slugify_channel_name(clean_name)}")
             await interaction.response.send_message(
-                f"✅ Kanal wurde in **{self.new_name.value}** umbenannt!", ephemeral=True
+                f"✅ Kanal wurde in **{clean_name}** umbenannt *(für zukünftige Kanäle gemerkt 💾)*!",
+                ephemeral=True,
             )
             await update_temp_voice_panel(interaction.guild, self.voice_channel_id)
         except Exception as e:
@@ -207,10 +218,11 @@ class SetLimitModal(discord.ui.Modal, title="Nutzer-Limit setzen"):
             return
         try:
             await vc.edit(user_limit=val)
+            update_temp_voice_prefs(interaction.user.id, limit=val)
             if self.voice_channel_id in temp_voice_channels:
                 temp_voice_channels[self.voice_channel_id]["limit"] = val
             await interaction.response.send_message(
-                f"✅ Nutzer-Limit auf **{val if val > 0 else 'kein Limit'}** gesetzt!",
+                f"✅ Nutzer-Limit auf **{val if val > 0 else 'kein Limit'}** gesetzt *(gemerkt 💾)*!",
                 ephemeral=True,
             )
             await update_temp_voice_panel(interaction.guild, self.voice_channel_id)
@@ -249,8 +261,9 @@ class SetBitrateModal(discord.ui.Modal, title="Bitrate ändern"):
             return
         try:
             await vc.edit(bitrate=br * 1000)
+            update_temp_voice_prefs(interaction.user.id, bitrate_kbps=br)
             await interaction.response.send_message(
-                f"✅ Bitrate auf **{br} kbps** gesetzt!", ephemeral=True
+                f"✅ Bitrate auf **{br} kbps** gesetzt *(gemerkt 💾)*!", ephemeral=True
             )
             await update_temp_voice_panel(interaction.guild, self.voice_channel_id)
         except Exception as e:
@@ -516,6 +529,34 @@ class VoiceChannelControlView(discord.ui.View):
             ephemeral=True,
         )
 
+    @discord.ui.button(label="♻️ Standard", style=discord.ButtonStyle.secondary, row=2, custom_id="vc_reset_prefs_btn")
+    async def btn_reset_prefs(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
+        vid = await self._owner_check(interaction)
+        if not vid or not interaction.guild:
+            return
+        vc = interaction.guild.get_channel(vid)
+        vc_data = temp_voice_channels.get(vid)
+        if not isinstance(vc, discord.VoiceChannel) or not vc_data:
+            await interaction.response.send_message("❌ Kanal nicht gefunden.", ephemeral=True)
+            return
+
+        clear_temp_voice_prefs(interaction.user.id)
+        default_name = f"🎙️ {interaction.user.display_name}'s Kanal"
+        default_bps = min(64000, int(getattr(interaction.guild, "bitrate_limit", 96000) or 96000))
+        try:
+            await vc.edit(name=default_name, user_limit=0, bitrate=default_bps)
+            vc_data["limit"] = 0
+            tc = interaction.guild.get_channel(vc_data.get("text_channel_id", 0))
+            if isinstance(tc, discord.TextChannel):
+                await tc.edit(name=f"💬{_slugify_channel_name(interaction.user.display_name)}s-kanal")
+            await interaction.response.send_message(
+                "♻️ Gespeichertes Kanal-Gedächtnis gelöscht und Kanal auf Standardwerte zurückgesetzt!",
+                ephemeral=True,
+            )
+            await update_temp_voice_panel(interaction.guild, vid)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Fehler beim Zurücksetzen: {e}", ephemeral=True)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TEMP VOICE COG
@@ -538,7 +579,13 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                 trigger = guild.get_channel(TEMP_VOICE_CHANNEL_ID)
                 category = trigger.category if trigger else None
 
-            channel_name = f"🎙️ {member.display_name}'s Kanal"
+            saved = get_temp_voice_prefs(member.id)
+            channel_name = (saved.get("name") or "").strip() or f"🎙️ {member.display_name}'s Kanal"
+            saved_limit = max(0, min(99, int(saved.get("limit") or 0)))
+            max_bps = int(getattr(guild, "bitrate_limit", 96000) or 96000)
+            saved_br_kbps = int(saved.get("bitrate_kbps") or 0)
+            saved_bps = min(max_bps, max(8000, saved_br_kbps * 1000)) if saved_br_kbps >= 8 else None
+
             overwrites_vc: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
                 guild.default_role: discord.PermissionOverwrite(connect=True, view_channel=True),
                 member: discord.PermissionOverwrite(
@@ -556,12 +603,17 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                     connect=True, view_channel=True, move_members=True
                 )
 
-            vc = await guild.create_voice_channel(
-                name=channel_name,
-                category=category,
-                overwrites=overwrites_vc,
-                reason=f"Temp Voice: {member.display_name}",
-            )
+            vc_kwargs: dict[str, Any] = {
+                "name": channel_name,
+                "category": category,
+                "overwrites": overwrites_vc,
+                "user_limit": saved_limit,
+                "reason": f"Temp Voice: {member.display_name}",
+            }
+            if saved_bps is not None:
+                vc_kwargs["bitrate"] = saved_bps
+
+            vc = await guild.create_voice_channel(**vc_kwargs)
 
             overwrites_tc: dict[discord.Role | discord.Member, discord.PermissionOverwrite] = {
                 guild.default_role: discord.PermissionOverwrite(read_messages=False, send_messages=False),
@@ -576,8 +628,13 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
             if admin_role:
                 overwrites_tc[admin_role] = discord.PermissionOverwrite(read_messages=True, send_messages=True)
 
+            tc_slug = (
+                _slugify_channel_name(saved["name"])
+                if saved.get("name")
+                else f"{_slugify_channel_name(member.display_name)}s-kanal"
+            )
             tc = await guild.create_text_channel(
-                name=f"💬{_slugify_channel_name(member.display_name)}s-kanal",
+                name=f"💬{tc_slug}",
                 category=category,
                 overwrites=overwrites_tc,
                 topic=f"Privater Kanal von {member.display_name} | VC-ID: {vc.id}",
@@ -591,7 +648,7 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                 "control_message_id": 0,
                 "allowed_users": set(),
                 "locked": False,
-                "limit": 0,
+                "limit": saved_limit,
             }
 
             try:

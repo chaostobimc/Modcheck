@@ -3,6 +3,7 @@
 COG_EXTENSIONS: tuple[str, ...] = (
     "cogs.general",
     "cogs.activity",
+    "cogs.alerts",
     "cogs.tickets",
     "cogs.temp_voice",
     "cogs.music",

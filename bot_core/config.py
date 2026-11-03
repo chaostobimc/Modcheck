@@ -39,6 +39,8 @@ VAULT_FILE = os.path.join(BASE_DIR, "vault.json")
 TICKET_DATA_FILE = os.path.join(BASE_DIR, "tickets.json")
 ABSENCE_FILE = os.path.join(BASE_DIR, "absences.json")
 STATS_FILE = os.path.join(BASE_DIR, "dashboard_stats.json")
+PREFS_FILE = os.path.join(BASE_DIR, "user_prefs.json")
+ALERTS_FILE = os.path.join(BASE_DIR, "alerts_state.json")
 
 
 def _env_int(name: str, default: int = 0) -> int:
@@ -90,6 +92,19 @@ STREAMER_OAUTH_TOKEN = (
 ).replace("oauth:", "")
 TWITCH_LOG_CHANNEL_ID = _env_int("TWITCH_LOG_CHANNEL_ID", 0)
 REVIEW_CHANNEL_ID = _env_int("REVIEW_CHANNEL_ID", 0)
+
+# ── Live-, YouTube- & Mod-Inaktivitäts-Alerts ───────────────────────────────
+LIVE_ANNOUNCE_CHANNEL_ID = _env_int("LIVE_ANNOUNCE_CHANNEL_ID", 0)
+LIVE_PING_ROLE_ID = _env_int("LIVE_PING_ROLE_ID", 0)
+LIVE_PING_EVERYONE = os.getenv("LIVE_PING_EVERYONE", "false").strip().lower() in ("true", "1", "yes")
+
+YOUTUBE_ANNOUNCE_CHANNEL_ID = _env_int("YOUTUBE_ANNOUNCE_CHANNEL_ID", 0)
+YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "").strip()
+YOUTUBE_PING_ROLE_ID = _env_int("YOUTUBE_PING_ROLE_ID", 0)
+YOUTUBE_PING_EVERYONE = os.getenv("YOUTUBE_PING_EVERYONE", "false").strip().lower() in ("true", "1", "yes")
+
+INACTIVITY_WARN_CHANNEL_ID = _env_int("INACTIVITY_WARN_CHANNEL_ID", 0)
+INACTIVITY_WARN_STREAMS = _env_int("INACTIVITY_WARN_STREAMS", 5)
 
 # ── Musik, Spotify & Radio ──────────────────────────────────────────────────
 MUSIC_ENABLED = os.getenv("MUSIC_ENABLED", "true").strip().lower() in ("true", "1", "yes")
@@ -144,6 +159,7 @@ COLOR_ABSENCE = 0x95A5A6
 COLOR_RADIO = 0x1ABC9C
 COLOR_CONNECT4 = 0xFFC300
 COLOR_TICTACTOE = 0x00BCD4
+COLOR_YOUTUBE = 0xFF0000
 
 # ── Kalender-Konstanten ─────────────────────────────────────────────────────
 MONTH_NAMES = [
