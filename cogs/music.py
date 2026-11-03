@@ -194,7 +194,10 @@ class GuildMusicState:
         self.autoplay: bool = False
         self.loop_mode: str = "off"  # "off" | "track" | "queue"
         self.history: deque[str] = deque(maxlen=15)
+        self.is_loading: bool = False
         self._idle_seconds: int = 0
+        self._empty_seconds: int = 0
+        self._stale_current_seconds: int = 0
         self._lock = asyncio.Lock()
         self.consecutive_failures: int = 0
 
@@ -217,34 +220,59 @@ class GuildMusicState:
             except Exception:
                 pass
 
-    async def cleanup(self) -> None:
-        """Trennt die Voice-Verbindung komplett lautlos (ohne Chat-Nachricht)."""
+    async def cleanup(self, disconnect_voice: bool = True) -> None:
+        """Trennt die Voice-Verbindung zuverlässig & komplett lautlos (ohne Chat-Nachricht)."""
         self.queue.clear()
         self.current = None
         self.loop_mode = "off"
+        self.is_loading = False
         self._idle_seconds = 0
+        self._empty_seconds = 0
+        self._stale_current_seconds = 0
         self.history.clear()
         await self.clear_np_buttons_silently()
-        if self.voice_client and self.voice_client.is_connected():
+
+        guild = self.bot.get_guild(self.guild_id)
+        seen_vcs: list[discord.VoiceClient] = []
+        for candidate in (self.voice_client, guild.voice_client if guild else None):
+            if candidate is not None and candidate not in seen_vcs:
+                seen_vcs.append(candidate)
+
+        for vc in seen_vcs:
             try:
-                if self.voice_client.is_playing() or self.voice_client.is_paused():
-                    self.voice_client.stop()
-                await self.voice_client.disconnect(force=True)
+                if vc.is_playing() or vc.is_paused():
+                    vc.stop()
             except Exception:
                 pass
+            if disconnect_voice:
+                try:
+                    await vc.disconnect(force=True)
+                except Exception:
+                    pass
+
+        # Falls der Bot auf dem Discord-Gateway noch im Kanal hängt (z. B. nach Neustart / Voice-Drop)
+        if disconnect_voice and guild is not None:
+            try:
+                me = guild.me
+                if me is not None and me.voice is not None and me.voice.channel is not None:
+                    await guild.change_voice_state(channel=None)
+            except Exception:
+                pass
+
         self.voice_client = None
         await self.restore_default_presence()
 
     def reset_idle(self) -> None:
         self._idle_seconds = 0
+        self._stale_current_seconds = 0
 
-    def increment_idle(self) -> None:
-        self._idle_seconds += 1
+    def increment_idle(self, seconds: int = 1) -> None:
+        self._idle_seconds += seconds
 
     @property
     def is_idle_timeout(self) -> bool:
-        timeout = int(runtime_settings.get("music_idle_timeout") or 180)
-        return self._idle_seconds >= max(30, timeout)
+        timeout = int(runtime_settings.get("music_idle_timeout") or 60)
+        return self._idle_seconds >= max(5, timeout)
 
 
 music_states: dict[int, GuildMusicState] = {}
@@ -254,6 +282,58 @@ def get_music_state(guild_id: int, bot: commands.Bot) -> GuildMusicState:
     if guild_id not in music_states:
         music_states[guild_id] = GuildMusicState(guild_id, bot)
     return music_states[guild_id]
+
+
+def _count_humans_in_channel(
+    guild: discord.Guild | None,
+    channel: discord.abc.Snowflake | None,
+    bot_id: int,
+) -> int:
+    """Zählt echte (nicht-Bot) Nutzer im Voice-Kanal über Gateway voice_states + Member-Liste."""
+    if guild is None or channel is None:
+        return 0
+    fresh_ch = guild.get_channel(channel.id) or channel
+    vstates = getattr(fresh_ch, "voice_states", None)
+    if isinstance(vstates, dict) and vstates:
+        humans = 0
+        for uid in vstates:
+            if uid == bot_id:
+                continue
+            member = guild.get_member(uid)
+            if member is not None and member.bot:
+                continue
+            humans += 1
+        return humans
+    return sum(
+        1
+        for m in getattr(fresh_ch, "members", [])
+        if not m.bot and m.id != bot_id
+    )
+
+
+async def ensure_voice_connected(
+    state: GuildMusicState,
+    target_channel: discord.VoiceChannel | discord.StageChannel,
+) -> discord.VoiceClient:
+    """Verbindet oder verschiebt den VoiceClient sauber (inkl. Sync mit guild.voice_client)."""
+    guild = target_channel.guild
+    existing: discord.VoiceClient | None = guild.voice_client or state.voice_client
+    if existing is not None:
+        if existing.is_connected():
+            if existing.channel is None or existing.channel.id != target_channel.id:
+                await existing.move_to(target_channel)
+            state.voice_client = existing
+            state.reset_idle()
+            return existing
+        try:
+            await existing.disconnect(force=True)
+        except Exception:
+            pass
+
+    vc = await target_channel.connect(self_deaf=True)
+    state.voice_client = vc
+    state.reset_idle()
+    return vc
 
 
 # ── YouTube Helpers ────────────────────────────────────────────────────────
@@ -528,6 +608,10 @@ async def _play_song_robust(
             # Innerhalb von 2.2s beendet -> meist 403 Forbidden -> nächsten Client testen!
             if song.duration == 0 or song.duration > 4 or early_error:
                 continue
+            # Sehr kurzer Soundeffekt (<= 4s) regulär beendet -> Callback nachreichen!
+            song.url = stream_url
+            after_cb(None)
+            return True
         except asyncio.TimeoutError:
             done_flag.set()
             song.url = stream_url
@@ -542,44 +626,57 @@ async def play_next(state: GuildMusicState, text_channel: discord.abc.Messageabl
     channel = state.text_channel
 
     async with state._lock:
-        if not state.voice_client or not state.voice_client.is_connected():
+        guild = state.bot.get_guild(state.guild_id)
+        vc = state.voice_client or (guild.voice_client if guild else None)
+        if vc is not None and state.voice_client is not vc:
+            state.voice_client = vc
+
+        if not vc or not vc.is_connected():
             await state.cleanup()
             return
 
-        prev_song = state.current
-        next_song: SongInfo | None = None
+        state.is_loading = True
+        try:
+            prev_song = state.current
+            next_song: SongInfo | None = None
 
-        if prev_song and not prev_song.is_radio:
-            if state.loop_mode == "track":
-                next_song = prev_song
-            elif state.loop_mode == "queue":
-                state.queue.append(prev_song)
+            if prev_song and not prev_song.is_radio:
+                if state.loop_mode == "track":
+                    next_song = prev_song
+                elif state.loop_mode == "queue":
+                    state.queue.append(prev_song)
 
-        if next_song is None and state.queue:
-            next_song = state.queue.popleft()
+            if next_song is None and state.queue:
+                next_song = state.queue.popleft()
 
-        if next_song is None and state.autoplay and prev_song and not prev_song.is_radio:
-            next_song = await _find_autoplay_song(state, prev_song)
+            if next_song is None and state.autoplay and prev_song and not prev_song.is_radio:
+                next_song = await _find_autoplay_song(state, prev_song)
 
-        if next_song is None:
-            state.current = None
-            await state.clear_np_buttons_silently()
-            await state.restore_default_presence()
-            return
+            if next_song is None:
+                state.current = None
+                await state.clear_np_buttons_silently()
+                await state.restore_default_presence()
+                # Falls inzwischen auch niemand mehr im Kanal ist -> sofort lautlos leaven!
+                bot_id = state.bot.user.id if state.bot.user else 0
+                if guild and _count_humans_in_channel(guild, vc.channel, bot_id) == 0:
+                    await state.cleanup()
+                return
 
-        state.current = next_song
-        state.reset_idle()
-        if next_song.webpage_url:
-            state.history.append(next_song.webpage_url)
+            state.current = next_song
+            state.reset_idle()
+            if next_song.webpage_url:
+                state.history.append(next_song.webpage_url)
 
-        bot_loop = state.bot.loop
+            bot_loop = state.bot.loop
 
-        def _after_playback(err: Exception | None) -> None:
-            if err:
-                print(f"⚠️ [Music] Playback beendet mit Fehler: {err}")
-            asyncio.run_coroutine_threadsafe(play_next(state), bot_loop)
+            def _after_playback(err: Exception | None) -> None:
+                if err:
+                    print(f"⚠️ [Music] Playback beendet mit Fehler: {err}")
+                asyncio.run_coroutine_threadsafe(play_next(state), bot_loop)
 
-        ok = await _play_song_robust(state, next_song, _after_playback)
+            ok = await _play_song_robust(state, next_song, _after_playback)
+        finally:
+            state.is_loading = False
         if not ok:
             state.consecutive_failures += 1
             state.current = None
@@ -875,10 +972,13 @@ class SearchResultSelectView(discord.ui.View):
         state = get_music_state(interaction.guild_id, self.bot)
         vc_target = interaction.user.voice.channel
 
-        if state.voice_client is None or not state.voice_client.is_connected():
-            state.voice_client = await vc_target.connect(self_deaf=True)
-        elif state.voice_client.channel.id != vc_target.id:
-            await state.voice_client.move_to(vc_target)
+        try:
+            await ensure_voice_connected(state, vc_target)
+        except Exception as e:
+            await interaction.edit_original_response(
+                content=f"❌ Konnte dem Voice-Kanal nicht beitreten: {e}", embed=None, view=None
+            )
+            return
 
         song = SongInfo(
             title=entry.get("title", "Unbekannt"),
@@ -892,7 +992,7 @@ class SearchResultSelectView(discord.ui.View):
         await interaction.edit_original_response(
             content=f"✅ **{song.title}** ausgewählt!", embed=None, view=None
         )
-        if not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
+        if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
             await play_next(state, interaction.channel)
 
 
@@ -910,10 +1010,15 @@ async def start_radio_stream(
         return
 
     user_vc = interaction.user.voice.channel
-    if state.voice_client is None or not state.voice_client.is_connected():
-        state.voice_client = await user_vc.connect(self_deaf=True)
-    elif state.voice_client.channel.id != user_vc.id:
-        await state.voice_client.move_to(user_vc)
+    try:
+        await ensure_voice_connected(state, user_vc)
+    except Exception as e:
+        err_msg = f"❌ Konnte dem Voice-Kanal nicht beitreten: {e}"
+        if interaction.response.is_done():
+            await interaction.followup.send(err_msg, ephemeral=True)
+        else:
+            await interaction.response.send_message(err_msg, ephemeral=True)
+        return
 
     state.queue.clear()
     state.autoplay = False
@@ -1023,11 +1128,26 @@ class MusicCog(commands.Cog, name="Music"):
             await state.cleanup()
 
     def active_player_count(self) -> int:
-        return sum(
-            1
-            for s in music_states.values()
-            if s.voice_client and s.voice_client.is_connected()
+        return sum(1 for vc in self.bot.voice_clients if vc.is_connected())
+
+    async def _leave_if_still_empty(self, guild_id: int) -> None:
+        """Prüft nach 2s Verzögerung erneut, ob der Bot allein im Voice-Kanal ist, und verlässt ihn lautlos."""
+        await asyncio.sleep(2.0)
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            return
+        state = get_music_state(guild_id, self.bot)
+        vc = guild.voice_client or state.voice_client
+        bot_ch = (
+            (guild.me.voice.channel if guild.me and guild.me.voice else None)
+            or (vc.channel if vc else None)
         )
+        if bot_ch is None and vc is None:
+            return
+        bot_id = self.bot.user.id if self.bot.user else 0
+        if _count_humans_in_channel(guild, bot_ch, bot_id) == 0:
+            print(f"🎵 [Music] Kanal leer in Guild {guild_id} – verlasse Voice-Kanal lautlos.")
+            await state.cleanup()
 
     @commands.Cog.listener()
     async def on_voice_state_update(
@@ -1036,31 +1156,110 @@ class MusicCog(commands.Cog, name="Music"):
         before: discord.VoiceState,
         after: discord.VoiceState,
     ) -> None:
-        # Wenn der Bot selbst aus dem Voice-Kanal getrennt wurde -> Zustand lautlos bereinigen
-        if self.bot.user and member.id == self.bot.user.id:
+        bot_id = self.bot.user.id if self.bot.user else 0
+
+        # 1) Der Bot selbst hat den Kanal gewechselt oder wurde getrennt
+        if bot_id and member.id == bot_id:
             if before.channel is not None and after.channel is None:
                 state = music_states.get(member.guild.id)
                 if state:
-                    await state.cleanup()
-
-    # ── Idle Checker Task (verlässt den Kanal bei Inaktivität komplett lautlos!) ──
-
-    @tasks.loop(seconds=5)
-    async def music_idle_checker(self) -> None:
-        if not runtime_settings.get("music_enabled", MUSIC_ENABLED):
+                    await state.cleanup(disconnect_voice=False)
+            elif after.channel is not None:
+                state = get_music_state(member.guild.id, self.bot)
+                if member.guild.voice_client is not None:
+                    state.voice_client = member.guild.voice_client
+                if _count_humans_in_channel(member.guild, after.channel, bot_id) == 0:
+                    asyncio.create_task(self._leave_if_still_empty(member.guild.id))
             return
-        for state in list(music_states.values()):
-            vc = state.voice_client
-            if not vc or not vc.is_connected():
-                continue
-            humans = [m for m in vc.channel.members if not m.bot] if vc.channel else []
-            if not humans or (not vc.is_playing() and not vc.is_paused()):
-                state._idle_seconds += 5
-                if state.is_idle_timeout:
-                    # Verlässt den Voice-Kanal lautlos ohne Chat-Nachricht
+
+        # 2) Ein menschlicher User hat einen Kanal verlassen oder gewechselt -> sofort prüfen!
+        if not member.bot and before.channel is not None:
+            if after.channel is None or after.channel.id != before.channel.id:
+                guild = member.guild
+                vc = guild.voice_client or (
+                    music_states[guild.id].voice_client if guild.id in music_states else None
+                )
+                bot_ch = (
+                    (guild.me.voice.channel if guild.me and guild.me.voice else None)
+                    or (vc.channel if vc else None)
+                )
+                if bot_ch is not None and bot_ch.id == before.channel.id:
+                    if _count_humans_in_channel(guild, bot_ch, bot_id) == 0:
+                        asyncio.create_task(self._leave_if_still_empty(guild.id))
+
+    # ── Idle Checker Task (verlässt den Kanal bei Leere / Inaktivität komplett lautlos!) ──
+
+    @tasks.loop(seconds=2)
+    async def music_idle_checker(self) -> None:
+        try:
+            bot_id = self.bot.user.id if self.bot.user else 0
+            checked_guild_ids: set[int] = set()
+
+            guilds_to_check: list[discord.Guild] = list(self.bot.guilds)
+            for gid in list(music_states.keys()):
+                g = self.bot.get_guild(gid)
+                if g and g not in guilds_to_check:
+                    guilds_to_check.append(g)
+
+            for guild in guilds_to_check:
+                if guild.id in checked_guild_ids:
+                    continue
+                checked_guild_ids.add(guild.id)
+
+                existing_state = music_states.get(guild.id)
+                vc = guild.voice_client or (existing_state.voice_client if existing_state else None)
+                bot_ch = (
+                    (guild.me.voice.channel if guild.me and guild.me.voice else None)
+                    or (vc.channel if vc else None)
+                )
+
+                # Bot ist in dieser Guild in keinem Voice-Kanal
+                if vc is None and bot_ch is None:
+                    continue
+
+                state = get_music_state(guild.id, self.bot)
+                if vc is not None and state.voice_client is not vc:
+                    state.voice_client = vc
+
+                # Fall A: Niemand (kein echter Mensch) im Voice-Kanal -> sofort (nach 2s) leaven!
+                humans = _count_humans_in_channel(guild, bot_ch, bot_id)
+                if humans == 0:
+                    state._empty_seconds += 2
+                    if state._empty_seconds >= 2:
+                        print(f"🎵 [Music] Niemand im Voice-Kanal (Guild {guild.id}) – verlasse Kanal lautlos.")
+                        await state.cleanup()
+                    continue
+
+                state._empty_seconds = 0
+
+                # Fall B: Leute sind im Kanal – prüfen ob Musik läuft oder geladen wird
+                is_playing_or_paused = bool(vc and (vc.is_playing() or vc.is_paused()))
+                if is_playing_or_paused or state.is_loading:
+                    state.reset_idle()
+                    continue
+
+                # Falls noch Songs in der Queue warten, Wiedergabe anstoßen
+                if vc is not None and vc.is_connected() and state.queue:
+                    state.reset_idle()
+                    asyncio.create_task(play_next(state))
+                    continue
+
+                # Falls state.current noch hing, obwohl weder Audio läuft noch geladen wird -> nach 4s bereinigen
+                if state.current is not None:
+                    state._stale_current_seconds += 2
+                    if state._stale_current_seconds >= 4:
+                        state.current = None
+                    else:
+                        continue
+
+                # Weder Musik noch Queue noch Ladevorgang aktiv -> Idle-Timer hochzählen
+                state.increment_idle(2)
+                # Bei verwaistem Gateway-Voice-State ohne aktiven VoiceClient nach 6s trennen, sonst nach Timeout
+                if (vc is None and state._idle_seconds >= 6) or state.is_idle_timeout:
+                    print(f"🎵 [Music] Keine Musik aktiv (Guild {guild.id}) – verlasse Kanal lautlos.")
                     await state.cleanup()
-            else:
-                state.reset_idle()
+        except Exception as e:
+            print(f"⚠️ [Music] Idle-Checker Fehler: {e}")
 
     @music_idle_checker.before_loop
     async def _before_idle(self) -> None:
@@ -1085,183 +1284,180 @@ class MusicCog(commands.Cog, name="Music"):
         user_vc = interaction.user.voice.channel
         state = get_music_state(interaction.guild_id, self.bot)
 
-        if state.voice_client is None or not state.voice_client.is_connected():
-            perms = user_vc.permissions_for(interaction.guild.me)
-            if not perms.connect or not perms.speak:
-                await interaction.followup.send(
-                    f"❌ Keine Berechtigung (`Verbinden` & `Sprechen`) für **{user_vc.name}**!"
-                )
-                return
+        perms = user_vc.permissions_for(interaction.guild.me)
+        if not perms.connect or not perms.speak:
+            await interaction.followup.send(
+                f"❌ Keine Berechtigung (`Verbinden` & `Sprechen`) für **{user_vc.name}**!"
+            )
+            return
+
+        state.is_loading = True
+        try:
             try:
-                state.voice_client = await user_vc.connect(self_deaf=True)
+                await ensure_voice_connected(state, user_vc)
             except Exception as e:
                 await interaction.followup.send(f"❌ Konnte dem Voice-Kanal nicht beitreten: {e}")
                 return
-        elif state.voice_client.channel.id != user_vc.id:
-            try:
-                await state.voice_client.move_to(user_vc)
-            except Exception as e:
-                await interaction.followup.send(f"❌ Konnte nicht zum Kanal wechseln: {e}")
-                return
 
-        # Falls Radio lief -> beenden für reguläre Queue
-        if state.current and state.current.is_radio:
-            state.current = None
-            state.voice_client.stop()
-            await asyncio.sleep(0.2)
+            # Falls Radio lief -> beenden für reguläre Queue
+            if state.current and state.current.is_radio:
+                state.current = None
+                if state.voice_client:
+                    state.voice_client.stop()
+                await asyncio.sleep(0.2)
 
-        state.reset_idle()
+            state.reset_idle()
 
-        # 1) Spotify
-        if is_spotify_url(query):
-            sp_tracks = await fetch_spotify_tracks(query)
-            if not sp_tracks:
-                await interaction.followup.send("❌ Konnte keine Songs von Spotify laden.")
-                return
-            if len(sp_tracks) == 1:
-                sp = sp_tracks[0]
-                results = await search_tracks(sp["search_query"], limit=1)
-                if not results:
-                    await interaction.followup.send(f"❌ Konnte **{sp['title']}** nicht auf YouTube finden.")
+            # 1) Spotify
+            if is_spotify_url(query):
+                sp_tracks = await fetch_spotify_tracks(query)
+                if not sp_tracks:
+                    await interaction.followup.send("❌ Konnte keine Songs von Spotify laden.")
                     return
-                entry = results[0]
-                song = SongInfo(
-                    title=sp["title"],
-                    url="",
-                    webpage_url=_get_reference_url(entry),
-                    duration=sp.get("duration") or int(entry.get("duration") or 0),
-                    thumbnail=sp.get("thumbnail") or _entry_thumbnail(entry),
-                    requester=interaction.user,
-                )
-                state.queue.append(song)
-                if not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
-                    msg = await interaction.followup.send(f"🟢 **{sp['title']}** wird geladen...", wait=True)
-                    try:
-                        await msg.delete(delay=4)
-                    except Exception:
-                        pass
-                    await play_next(state, interaction.channel)
-                else:
-                    embed = discord.Embed(
-                        title="➕ Spotify → Warteschlange",
-                        description=f"🟢 **{song.title}**",
-                        color=COLOR_SPOTIFY,
+                if len(sp_tracks) == 1:
+                    sp = sp_tracks[0]
+                    results = await search_tracks(sp["search_query"], limit=1)
+                    if not results:
+                        await interaction.followup.send(f"❌ Konnte **{sp['title']}** nicht auf YouTube finden.")
+                        return
+                    entry = results[0]
+                    song = SongInfo(
+                        title=sp["title"],
+                        url="",
+                        webpage_url=_get_reference_url(entry),
+                        duration=sp.get("duration") or int(entry.get("duration") or 0),
+                        thumbnail=sp.get("thumbnail") or _entry_thumbnail(entry),
+                        requester=interaction.user,
                     )
-                    embed.add_field(name="⏱️ Dauer", value=song.duration_str, inline=True)
-                    embed.add_field(name="📋 Position", value=f"#{len(state.queue)}", inline=True)
-                    if song.thumbnail:
-                        embed.set_thumbnail(url=song.thumbnail)
-                    await interaction.followup.send(embed=embed)
-                return
-
-            # Spotify Playlist / Album (ersten Track sofort auflösen, Rest asynchron)
-            first = sp_tracks[0]
-            first_res = await search_tracks(first["search_query"], limit=1)
-            added = 0
-            if first_res:
-                e0 = first_res[0]
-                state.queue.append(
-                    SongInfo(
-                        first["title"], "", _get_reference_url(e0),
-                        first.get("duration") or int(e0.get("duration") or 0),
-                        first.get("thumbnail") or _entry_thumbnail(e0),
-                        interaction.user,
-                    )
-                )
-                added += 1
-
-            async def _queue_remaining() -> None:
-                for sp in sp_tracks[1:]:
-                    res = await search_tracks(sp["search_query"], limit=1)
-                    if res:
-                        en = res[0]
-                        state.queue.append(
-                            SongInfo(
-                                sp["title"], "", _get_reference_url(en),
-                                sp.get("duration") or int(en.get("duration") or 0),
-                                sp.get("thumbnail") or _entry_thumbnail(en),
-                                interaction.user,
-                            )
+                    state.queue.append(song)
+                    if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
+                        msg = await interaction.followup.send(f"🟢 **{sp['title']}** wird geladen...", wait=True)
+                        try:
+                            await msg.delete(delay=4)
+                        except Exception:
+                            pass
+                        await play_next(state, interaction.channel)
+                    else:
+                        embed = discord.Embed(
+                            title="➕ Spotify → Warteschlange",
+                            description=f"🟢 **{song.title}**",
+                            color=COLOR_SPOTIFY,
                         )
-                    await asyncio.sleep(0.2)
+                        embed.add_field(name="⏱️ Dauer", value=song.duration_str, inline=True)
+                        embed.add_field(name="📋 Position", value=f"#{len(state.queue)}", inline=True)
+                        if song.thumbnail:
+                            embed.set_thumbnail(url=song.thumbnail)
+                        await interaction.followup.send(embed=embed)
+                    return
 
-            asyncio.create_task(_queue_remaining())
-            embed = discord.Embed(
-                title="🟢 Spotify Playlist/Album erkannt!",
-                description=f"**{len(sp_tracks)}** Songs werden zur Warteschlange hinzugefügt.",
-                color=COLOR_SPOTIFY,
-            )
-            await interaction.followup.send(embed=embed)
-            if not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
-                await play_next(state, interaction.channel)
-            return
-
-        # 2) YouTube Playlist
-        if _is_playlist_url(query):
-            entries = await extract_playlist(query)
-            if not entries:
-                await interaction.followup.send("❌ Konnte keine Songs aus der Playlist laden.")
-                return
-            added = 0
-            for entry in entries:
-                ref = _get_reference_url(entry)
-                if not ref:
-                    continue
-                state.queue.append(
-                    SongInfo(
-                        entry.get("title", "Unbekannt"),
-                        "",
-                        ref,
-                        int(entry.get("duration") or 0),
-                        _entry_thumbnail(entry),
-                        interaction.user,
+                # Spotify Playlist / Album (ersten Track sofort auflösen, Rest asynchron)
+                first = sp_tracks[0]
+                first_res = await search_tracks(first["search_query"], limit=1)
+                if first_res:
+                    e0 = first_res[0]
+                    state.queue.append(
+                        SongInfo(
+                            first["title"], "", _get_reference_url(e0),
+                            first.get("duration") or int(e0.get("duration") or 0),
+                            first.get("thumbnail") or _entry_thumbnail(e0),
+                            interaction.user,
+                        )
                     )
+
+                async def _queue_remaining() -> None:
+                    for sp in sp_tracks[1:]:
+                        res = await search_tracks(sp["search_query"], limit=1)
+                        if res:
+                            en = res[0]
+                            state.queue.append(
+                                SongInfo(
+                                    sp["title"], "", _get_reference_url(en),
+                                    sp.get("duration") or int(en.get("duration") or 0),
+                                    sp.get("thumbnail") or _entry_thumbnail(en),
+                                    interaction.user,
+                                )
+                            )
+                        await asyncio.sleep(0.2)
+
+                asyncio.create_task(_queue_remaining())
+                embed = discord.Embed(
+                    title="🟢 Spotify Playlist/Album erkannt!",
+                    description=f"**{len(sp_tracks)}** Songs werden zur Warteschlange hinzugefügt.",
+                    color=COLOR_SPOTIFY,
                 )
-                added += 1
-            embed = discord.Embed(
-                title="📋 Playlist hinzugefügt",
-                description=f"**{added}** Songs zur Warteschlange hinzugefügt!",
-                color=COLOR_MUSIC,
+                await interaction.followup.send(embed=embed)
+                if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
+                    await play_next(state, interaction.channel)
+                return
+
+            # 2) YouTube Playlist
+            if _is_playlist_url(query):
+                entries = await extract_playlist(query)
+                if not entries:
+                    await interaction.followup.send("❌ Konnte keine Songs aus der Playlist laden.")
+                    return
+                added = 0
+                for entry in entries:
+                    ref = _get_reference_url(entry)
+                    if not ref:
+                        continue
+                    state.queue.append(
+                        SongInfo(
+                            entry.get("title", "Unbekannt"),
+                            "",
+                            ref,
+                            int(entry.get("duration") or 0),
+                            _entry_thumbnail(entry),
+                            interaction.user,
+                        )
+                    )
+                    added += 1
+                embed = discord.Embed(
+                    title="📋 Playlist hinzugefügt",
+                    description=f"**{added}** Songs zur Warteschlange hinzugefügt!",
+                    color=COLOR_MUSIC,
+                )
+                await interaction.followup.send(embed=embed)
+                if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
+                    await play_next(state, interaction.channel)
+                return
+
+            # 3) Einzelner Song / Direktlink
+            results = await search_tracks(query, limit=1)
+            if not results:
+                await interaction.followup.send(f"❌ Keine Ergebnisse für: `{query}`")
+                return
+            entry = results[0]
+            song = SongInfo(
+                title=entry.get("title", "Unbekannt"),
+                url="",
+                webpage_url=_get_reference_url(entry, query),
+                duration=int(entry.get("duration") or 0),
+                thumbnail=_entry_thumbnail(entry),
+                requester=interaction.user,
             )
-            await interaction.followup.send(embed=embed)
-            if not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
+            state.queue.append(song)
+
+            if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
+                msg = await interaction.followup.send(f"🎵 **{song.title}** wird geladen...", wait=True)
+                try:
+                    await msg.delete(delay=4)
+                except Exception:
+                    pass
                 await play_next(state, interaction.channel)
-            return
-
-        # 3) Einzelner Song / Direktlink
-        results = await search_tracks(query, limit=1)
-        if not results:
-            await interaction.followup.send(f"❌ Keine Ergebnisse für: `{query}`")
-            return
-        entry = results[0]
-        song = SongInfo(
-            title=entry.get("title", "Unbekannt"),
-            url="",
-            webpage_url=_get_reference_url(entry, query),
-            duration=int(entry.get("duration") or 0),
-            thumbnail=_entry_thumbnail(entry),
-            requester=interaction.user,
-        )
-        state.queue.append(song)
-
-        if not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
-            msg = await interaction.followup.send(f"🎵 **{song.title}** wird geladen...", wait=True)
-            try:
-                await msg.delete(delay=4)
-            except Exception:
-                pass
-            await play_next(state, interaction.channel)
-        else:
-            embed = discord.Embed(
-                title="➕ Zur Warteschlange hinzugefügt",
-                description=f"[{song.title}]({song.webpage_url})",
-                color=COLOR_MUSIC,
-            )
-            embed.add_field(name="⏱️ Dauer", value=song.duration_str, inline=True)
-            embed.add_field(name="📋 Position", value=f"#{len(state.queue)}", inline=True)
-            if song.thumbnail:
-                embed.set_thumbnail(url=song.thumbnail)
-            await interaction.followup.send(embed=embed)
+            else:
+                embed = discord.Embed(
+                    title="➕ Zur Warteschlange hinzugefügt",
+                    description=f"[{song.title}]({song.webpage_url})",
+                    color=COLOR_MUSIC,
+                )
+                embed.add_field(name="⏱️ Dauer", value=song.duration_str, inline=True)
+                embed.add_field(name="📋 Position", value=f"#{len(state.queue)}", inline=True)
+                if song.thumbnail:
+                    embed.set_thumbnail(url=song.thumbnail)
+                await interaction.followup.send(embed=embed)
+        finally:
+            state.is_loading = False
 
     @app_commands.command(name="search", description="🎵 Suche nach Songs und wähle einen aus")
     @app_commands.describe(query="Songtitel zum Suchen")

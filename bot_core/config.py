@@ -93,7 +93,7 @@ REVIEW_CHANNEL_ID = _env_int("REVIEW_CHANNEL_ID", 0)
 
 # ── Musik, Spotify & Radio ──────────────────────────────────────────────────
 MUSIC_ENABLED = os.getenv("MUSIC_ENABLED", "true").strip().lower() in ("true", "1", "yes")
-MUSIC_IDLE_TIMEOUT = _env_int("MUSIC_IDLE_TIMEOUT", 180)
+MUSIC_IDLE_TIMEOUT = _env_int("MUSIC_IDLE_TIMEOUT", 60)
 SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID", "").strip()
 SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET", "").strip()
 YOUTUBE_COOKIES_FILE = os.getenv("YOUTUBE_COOKIES_FILE", "cookies.txt").strip()
