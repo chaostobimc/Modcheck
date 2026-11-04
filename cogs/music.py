@@ -4,8 +4,10 @@ from __future__ import annotations
 import asyncio
 from collections import deque
 import os
+import queue
 import random
 import re
+import tempfile
 import threading
 import time
 from typing import Any
@@ -84,29 +86,46 @@ _YT_HEADERS = (
 
 FFMPEG_OPTIONS = {
     "before_options": (
-        "-nostdin -thread_queue_size 4096 "
-        "-probesize 64k -analyzeduration 0 "
-        "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
-        "-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5 "
+        "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
         f'-headers "{_YT_HEADERS}"'
     ),
-    "options": "-vn -sn -dn -bufsize 8M",
+    "options": "-vn",
 }
 
 RADIO_FFMPEG_OPTIONS = {
-    "before_options": (
-        "-nostdin -thread_queue_size 4096 "
-        "-probesize 64k -analyzeduration 0 "
-        "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
-        "-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5"
-    ),
-    "options": "-vn -sn -dn -bufsize 8M",
+    "before_options": "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
+    "options": "-vn",
 }
 
-BEST_AUDIO_FORMAT = (
-    "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/"
-    "bestaudio[protocol^=http][protocol!=m3u8][protocol!=m3u8_native]/bestaudio/best"
-)
+BEST_AUDIO_FORMAT = "bestaudio/best"
+
+
+def _build_ffmpeg_options(
+    http_headers: dict[str, Any] | None = None,
+    *,
+    is_radio: bool = False,
+) -> dict[str, str]:
+    """Baut saubere, mit allen FFmpeg-Versionen kompatible Optionen inkl. passendem Client-User-Agent."""
+    if is_radio:
+        return dict(RADIO_FFMPEG_OPTIONS)
+    header_blob = _YT_HEADERS
+    if http_headers:
+        ua = str(http_headers.get("User-Agent") or http_headers.get("user-agent") or "").replace('"', "").strip()
+        ref = str(
+            http_headers.get("Referer")
+            or http_headers.get("referer")
+            or "https://www.youtube.com/"
+        ).replace('"', "").strip()
+        if ua:
+            header_blob = f"Referer: {ref}\r\nUser-Agent: {ua}\r\n"
+    return {
+        "before_options": (
+            "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+            f'-headers "{header_blob}"'
+        ),
+        "options": "-vn",
+    }
+
 
 STREAM_URL_MAX_AGE_SECS = 2700  # 45 Minuten Cache-Gültigkeit für vorab aufgelöste Stream-URLs
 _ydl_thread_local = threading.local()
@@ -176,11 +195,13 @@ YTDL_PLAYLIST_OPTIONS = {
     **YDL_TIMEOUTS,
 }
 
-YDL_PLAYER_CLIENT_FALLBACKS: list[dict[str, Any] | None] = [
-    None,
-    {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["web"]}}},
+YDL_PLAYER_CLIENT_FALLBACKS: list[tuple[str, dict[str, Any] | None]] = [
+    ("android_vr", {"extractor_args": {"youtube": {"player_client": ["android_vr"]}}}),
+    ("android", {"extractor_args": {"youtube": {"player_client": ["android"]}}}),
+    ("ios", {"extractor_args": {"youtube": {"player_client": ["ios"]}}}),
+    ("tv", {"extractor_args": {"youtube": {"player_client": ["tv"]}}}),
+    ("web", {"extractor_args": {"youtube": {"player_client": ["web"]}}}),
+    ("default", None),
 ]
 
 
@@ -194,6 +215,8 @@ class SongInfo:
         "requester",
         "is_radio",
         "resolved_at",
+        "stream_headers",
+        "client_used",
     )
 
     def __init__(
@@ -206,6 +229,8 @@ class SongInfo:
         requester: discord.abc.User | None,
         is_radio: bool = False,
         resolved_at: float = 0.0,
+        stream_headers: dict[str, Any] | None = None,
+        client_used: str = "",
     ) -> None:
         self.title = title
         self.url = url
@@ -215,6 +240,8 @@ class SongInfo:
         self.requester = requester
         self.is_radio = is_radio
         self.resolved_at = resolved_at or (time.monotonic() if (url and not is_radio) else 0.0)
+        self.stream_headers = dict(stream_headers) if stream_headers else None
+        self.client_used = client_used
 
     def has_fresh_stream_url(self) -> bool:
         if self.is_radio:
@@ -525,10 +552,7 @@ def claim_or_check_dj(
         return None
 
     if require_dj and int(user.id) != state.dj_user_id:
-        return (
-            f"❌ Nur <@{state.dj_user_id}> kann den Musik-Player bedienen "
-            "(hat die Musik in dieser Runde gestartet)!"
-        )
+        return f"❌ Nur <@{state.dj_user_id}> kann die Musik aktuell steuern!"
     return None
 
 
@@ -556,6 +580,7 @@ async def ensure_voice_connected(
     vc = await target_channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
     state.voice_client = vc
     state.reset_idle()
+    print(f"🔊 [Music] Verbunden mit Voice-Kanal #{target_channel.name} (Guild {guild.id})")
     return vc
 
 
@@ -634,7 +659,7 @@ async def extract_playlist(url: str) -> list[dict[str, Any]]:
 def _resolve_with_client(
     target_query_or_url: str,
     extra_opts: dict[str, Any] | None = None,
-    client_idx: int = 0,
+    client_name: str = "default",
 ) -> tuple[str | None, dict | None]:
     ydl_opts: dict[str, Any] = {
         "format": BEST_AUDIO_FORMAT,
@@ -657,7 +682,7 @@ def _resolve_with_client(
         if merged_ext:
             ydl_opts["extractor_args"] = merged_ext
 
-    cache_key = f"stream_resolve:{client_idx}"
+    cache_key = f"stream_resolve:{client_name}"
     try:
         ydl = _get_thread_ydl(cache_key, ydl_opts)
         info = ydl.extract_info(target_query_or_url, download=False)
@@ -683,17 +708,17 @@ async def resolve_first_track_fast(
     requester: discord.abc.User | None,
 ) -> SongInfo | None:
     """
-    Löst Suche + direkten Opus/M4A-Audio-Stream in EINEM einzigen Schritt auf.
-    Spart beim Start eines neuen Songs einen kompletten zweiten yt-dlp-Aufruf (~50% schneller).
+    Löst Suche + direkten Audio-Stream in EINEM einzigen Schritt auf.
+    Spart beim Start eines neuen Songs einen kompletten zweiten yt-dlp-Aufruf.
     """
     if not YTDLP_AVAILABLE or not runtime_settings.get("music_enabled", MUSIC_ENABLED):
         return None
     q = query if _is_url(query) else f"ytsearch1:{query}"
     loop = asyncio.get_running_loop()
-    for idx, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
+    for client_name, extra_opts in YDL_PLAYER_CLIENT_FALLBACKS:
         try:
             stream_url, info = await loop.run_in_executor(
-                None, _resolve_with_client, q, extra_opts, idx
+                None, _resolve_with_client, q, extra_opts, client_name
             )
         except Exception:
             continue
@@ -708,6 +733,8 @@ async def resolve_first_track_fast(
                     thumbnail=_entry_thumbnail(info),
                     requester=requester,
                     resolved_at=time.monotonic() if stream_url else 0.0,
+                    stream_headers=info.get("http_headers") if isinstance(info, dict) else None,
+                    client_used=client_name if stream_url else "",
                 )
     return None
 
@@ -717,10 +744,10 @@ async def _prefetch_song_stream(song: SongInfo) -> None:
     if song.is_radio or song.has_fresh_stream_url() or not song.webpage_url:
         return
     loop = asyncio.get_running_loop()
-    for idx, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
+    for client_name, extra_opts in YDL_PLAYER_CLIENT_FALLBACKS:
         try:
             stream_url, info = await loop.run_in_executor(
-                None, _resolve_with_client, song.webpage_url, extra_opts, idx
+                None, _resolve_with_client, song.webpage_url, extra_opts, client_name
             )
         except asyncio.CancelledError:
             raise
@@ -729,7 +756,10 @@ async def _prefetch_song_stream(song: SongInfo) -> None:
         if stream_url:
             song.url = stream_url
             song.resolved_at = time.monotonic()
+            song.client_used = client_name
             if info:
+                if info.get("http_headers"):
+                    song.stream_headers = dict(info["http_headers"])
                 if not song.duration and info.get("duration"):
                     song.duration = int(info["duration"])
                 if not song.thumbnail:
@@ -873,24 +903,145 @@ def _make_volume_bar(pct: int) -> str:
     return f"{icon} `{bar}` **{pct}%**{boost}"
 
 
-def _create_audio_source(
-    stream_url: str,
-    base_ffmpeg_opts: dict[str, str],
-    volume_pct: int,
-) -> discord.AudioSource:
-    vol_float = max(0.05, min(2.0, volume_pct / 100.0))
-    raw = discord.FFmpegPCMAudio(stream_url, **base_ffmpeg_opts)
-    if hasattr(discord, "PCMVolumeTransformer"):
+class _BufferedPCMAudioSource(discord.AudioSource):
+    """
+    Entkoppelter 7-Sekunden-RAM-Audio-Puffer vor Discords 20ms-Voice-Loop:
+    1. Prüft vor dem Abspielen garantiert, dass FFmpeg ECHTE PCM-Audiodaten liefert (fängt HTTP 403 zu 100% ab).
+    2. Puffert bis zu 350 Frames (7s Audio) im RAM vor -> kein Stottern/Nachbuffern mitten im Lied.
+    """
+
+    PCM_FRAME_SIZE = 3840  # 20ms @ 48kHz, 16-bit Stereo
+
+    def __init__(
+        self,
+        stream_url: str,
+        ffmpeg_opts: dict[str, str],
+        loop: asyncio.AbstractEventLoop,
+        min_ready_frames: int = 10,
+        max_buffer_frames: int = 350,
+    ) -> None:
+        self._loop = loop
+        self._min_ready_frames = max(1, min_ready_frames)
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=max_buffer_frames)
+        self._ready_event = asyncio.Event()
+        self._closed = False
+        self._eof = False
+        self._failed = False
+        self._frames_produced = 0
+        self._stall_ticks = 0
+        self._stderr_fp = tempfile.TemporaryFile(mode="w+b")
+        self._raw = discord.FFmpegPCMAudio(
+            stream_url,
+            stderr=self._stderr_fp,
+            **ffmpeg_opts,
+        )
+        self._reader_thread = threading.Thread(
+            target=self._reader_loop,
+            name="modcheck-pcm-buffer",
+            daemon=True,
+        )
+        self._reader_thread.start()
+
+    def is_opus(self) -> bool:
+        return False
+
+    def _signal_ready(self) -> None:
         try:
-            return discord.PCMVolumeTransformer(raw, volume=vol_float)
+            self._loop.call_soon_threadsafe(self._ready_event.set)
         except Exception:
             pass
-    # Fallback über FFmpeg-Filter falls PCMVolumeTransformer auf einer Plattform nicht verfügbar ist
-    fallback_opts = {
-        "before_options": base_ffmpeg_opts.get("before_options", ""),
-        "options": f"{base_ffmpeg_opts.get('options', '-vn')} -filter:a volume={vol_float:.2f}".strip(),
-    }
-    return discord.FFmpegPCMAudio(stream_url, **fallback_opts)
+
+    def _reader_loop(self) -> None:
+        try:
+            while not self._closed:
+                frame = self._raw.read()
+                if not frame:
+                    self._eof = True
+                    if self._frames_produced == 0:
+                        self._failed = True
+                    self._signal_ready()
+                    self._put_frame(b"")
+                    return
+
+                self._frames_produced += 1
+                self._put_frame(frame)
+                if self._frames_produced == self._min_ready_frames:
+                    self._signal_ready()
+        except Exception:
+            self._eof = True
+            if self._frames_produced == 0:
+                self._failed = True
+            self._signal_ready()
+            self._put_frame(b"")
+
+    def _put_frame(self, data: bytes) -> None:
+        while not self._closed:
+            try:
+                self._queue.put(data, timeout=0.5)
+                return
+            except queue.Full:
+                continue
+
+    async def wait_until_ready(self, timeout: float = 10.0) -> bool:
+        """Wartet, bis echte dekodierte PCM-Frames bereitliegen (oder FFmpeg sofort mit Fehler abbricht)."""
+        try:
+            await asyncio.wait_for(self._ready_event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return self._frames_produced > 0 and not self._failed
+        return self._frames_produced > 0 and not self._failed
+
+    def read_stderr_hint(self) -> str:
+        try:
+            self._stderr_fp.flush()
+            self._stderr_fp.seek(0)
+            raw_err = self._stderr_fp.read(4096).decode("utf-8", errors="replace").strip()
+            if not raw_err:
+                return "kein Audio-Output (EOF)"
+            lines = [ln.strip() for ln in raw_err.splitlines() if ln.strip()]
+            return lines[-1][:180] if lines else "kein Audio-Output"
+        except Exception:
+            return "FFmpeg-Fehler"
+
+    def read(self) -> bytes:
+        if self._closed:
+            return b""
+        try:
+            chunk = self._queue.get(timeout=4.0)
+            self._stall_ticks = 0
+            return chunk
+        except queue.Empty:
+            if self._eof or self._closed:
+                return b""
+            self._stall_ticks += 1
+            if self._stall_ticks > 3:
+                return b""
+            return b"\x00" * self.PCM_FRAME_SIZE
+
+    def cleanup(self) -> None:
+        self._closed = True
+        try:
+            while True:
+                self._queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._raw.cleanup()
+        except Exception:
+            pass
+        try:
+            self._stderr_fp.close()
+        except Exception:
+            pass
+
+
+def _wrap_volume(inner: discord.AudioSource, volume_pct: int) -> discord.AudioSource:
+    vol_float = max(0.05, min(2.0, volume_pct / 100.0))
+    if hasattr(discord, "PCMVolumeTransformer"):
+        try:
+            return discord.PCMVolumeTransformer(inner, volume=vol_float)
+        except Exception:
+            pass
+    return inner
 
 
 async def _try_start_ffmpeg_stream(
@@ -899,40 +1050,48 @@ async def _try_start_ffmpeg_stream(
     stream_url: str,
     ffmpeg_opts: dict[str, str],
     after_cb,
-    verify_seconds: float = 0.55,
+    client_label: str = "stream",
 ) -> bool:
-    """Startet FFmpeg und prüft kurz (~0.55s), ob kein sofortiger HTTP-403/Verbindungsabbruch auftritt."""
+    """
+    Startet FFmpeg mit vorgelagertem PCM-RAM-Puffer und gibt NUR dann True zurück,
+    wenn nachweislich echte Audiodaten dekodiert wurden.
+    """
     if not state.voice_client or not state.voice_client.is_connected():
         return False
 
-    early_error: list[Exception] = []
-    done_flag = asyncio.Event()
-
-    def _wrapped_after(err: Exception | None) -> None:
-        if not done_flag.is_set():
-            if err:
-                early_error.append(err)
-            done_flag.set()
-            return
-        after_cb(err)
-
+    loop = asyncio.get_running_loop()
+    buf_source: _BufferedPCMAudioSource | None = None
     try:
-        source = _create_audio_source(stream_url, ffmpeg_opts, state.volume_pct)
-        state.voice_client.play(source, after=_wrapped_after)
-    except Exception:
+        buf_source = _BufferedPCMAudioSource(
+            stream_url=stream_url,
+            ffmpeg_opts=ffmpeg_opts,
+            loop=loop,
+            min_ready_frames=10,
+            max_buffer_frames=350,
+        )
+    except Exception as e:
+        print(f"❌ [Music] FFmpeg konnte nicht gestartet werden ({client_label}): {e}")
+        return False
+
+    ready = await buf_source.wait_until_ready(timeout=10.0)
+    if not ready or not state.voice_client or not state.voice_client.is_connected():
+        hint = buf_source.read_stderr_hint()
+        print(f"⚠️ [Music] Stream über '{client_label}' lieferte kein Audio ({hint}) – wechsle Fallback...")
+        buf_source.cleanup()
         return False
 
     try:
-        await asyncio.wait_for(done_flag.wait(), timeout=verify_seconds)
-        # Innerhalb von verify_seconds beendet -> meist 403 Forbidden -> nächsten Client testen!
-        if song.is_radio or song.duration == 0 or song.duration > 3 or early_error:
-            return False
-        # Ultrakurzer Soundeffekt (<= 3s) regulär beendet -> Callback nachreichen!
-        after_cb(None)
+        source = _wrap_volume(buf_source, state.volume_pct)
+        state.voice_client.play(source, after=after_cb)
+        print(
+            f"🎵 [Music] Spielt jetzt: {song.title} "
+            f"(Client: {client_label}, Lautstärke: {state.volume_pct}%)"
+        )
         return True
-    except asyncio.TimeoutError:
-        done_flag.set()
-        return True
+    except Exception as e:
+        print(f"❌ [Music] VoiceClient.play Fehler ({client_label}): {e}")
+        buf_source.cleanup()
+        return False
 
 
 async def _play_song_robust(
@@ -942,47 +1101,64 @@ async def _play_song_robust(
         return False
 
     if song.is_radio and song.url:
+        opts = _build_ffmpeg_options(is_radio=True)
         return await _try_start_ffmpeg_stream(
-            state, song, song.url, RADIO_FFMPEG_OPTIONS, after_cb, verify_seconds=0.8
+            state, song, song.url, opts, after_cb, client_label="radio"
         )
+
+    tried_first_client = ""
 
     # 1) Blitzstart: Bereits vorab aufgelöste Stream-URL (von /play Direktauflösung oder Queue-Prefetch!)
     if song.has_fresh_stream_url():
+        tried_first_client = song.client_used or "prefetched"
+        opts = _build_ffmpeg_options(song.stream_headers, is_radio=False)
         if await _try_start_ffmpeg_stream(
-            state, song, song.url, FFMPEG_OPTIONS, after_cb, verify_seconds=0.55
+            state, song, song.url, opts, after_cb, client_label=tried_first_client
         ):
             return True
-        # Falls abgelaufen -> frisch auflösen
+        # Falls z. B. 403 -> verwerfen & restliche Clients durchtesten!
         song.url = ""
         song.resolved_at = 0.0
+        song.stream_headers = None
+        song.client_used = ""
 
-    # 2) Frische Auflösung mit optimierter Client-Reihenfolge
+    # 2) Frische Auflösung über alle Fallback-Clients, bis echter Audio-Output fließt
     loop = asyncio.get_running_loop()
-    for idx, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
+    for client_name, extra_opts in YDL_PLAYER_CLIENT_FALLBACKS:
+        if client_name == tried_first_client:
+            continue
         if not state.voice_client or not state.voice_client.is_connected():
             return False
         try:
             stream_url, info = await loop.run_in_executor(
-                None, _resolve_with_client, song.webpage_url, extra_opts, idx
+                None, _resolve_with_client, song.webpage_url, extra_opts, client_name
             )
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ [Music] yt-dlp Client '{client_name}' Fehler: {e}")
             continue
         if not stream_url:
             continue
 
+        hdrs: dict[str, Any] | None = None
         if info:
+            if info.get("http_headers"):
+                hdrs = dict(info["http_headers"])
             if not song.duration and info.get("duration"):
                 song.duration = int(info["duration"])
             if not song.thumbnail:
                 song.thumbnail = _entry_thumbnail(info)
 
+        opts = _build_ffmpeg_options(hdrs, is_radio=False)
         if await _try_start_ffmpeg_stream(
-            state, song, stream_url, FFMPEG_OPTIONS, after_cb, verify_seconds=0.55
+            state, song, stream_url, opts, after_cb, client_label=client_name
         ):
             song.url = stream_url
             song.resolved_at = time.monotonic()
+            song.stream_headers = hdrs
+            song.client_used = client_name
             return True
 
+    print(f"❌ [Music] Alle Stream-Clients fehlgeschlagen für: {song.title} ({song.webpage_url})")
     return False
 
 
@@ -1156,8 +1332,6 @@ def build_now_playing_embed(state: GuildMusicState) -> discord.Embed:
     embed.add_field(name="⏱️ Dauer", value=song.duration_str, inline=True)
     embed.add_field(name="👤 Angefragt von", value=req_str, inline=True)
     embed.add_field(name="📋 Queue", value=f"{len(state.queue)} Songs", inline=True)
-    if state.dj_user_id:
-        embed.add_field(name="🎛️ Kontrolle (DJ)", value=f"<@{state.dj_user_id}>", inline=True)
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
 
@@ -1784,17 +1958,9 @@ class MusicCog(commands.Cog, name="Music"):
                     if not remaining_humans:
                         asyncio.create_task(self._leave_if_still_empty(guild.id))
                     elif state and state.dj_user_id == member.id:
-                        # Der bisherige DJ hat den Kanal verlassen -> Kontrolle an nächsten Zuhörer übergeben
+                        # Bisheriger Steuer-User hat den Kanal verlassen -> intern an nächsten Zuhörer übergeben
                         state.dj_user_id = remaining_humans[0]
                         state.persist_session()
-                        if state.last_np_message and state.current:
-                            try:
-                                await state.last_np_message.edit(
-                                    embed=build_now_playing_embed(state),
-                                    view=MusicPlayerControlView(state),
-                                )
-                            except Exception:
-                                pass
 
     # ── Idle Checker Task (verlässt den Kanal bei Leere / Inaktivität komplett lautlos!) ──
 
