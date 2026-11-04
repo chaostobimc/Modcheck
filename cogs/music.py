@@ -580,7 +580,21 @@ async def ensure_voice_connected(
     vc = await target_channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
     state.voice_client = vc
     state.reset_idle()
-    print(f"🔊 [Music] Verbunden mit Voice-Kanal #{target_channel.name} (Guild {guild.id})")
+
+    # Kurz (max. 1.5s) auf Abschluss des Discord DAVE-E2EE MLS-Handshakes warten, damit kein Ton am Anfang verschluckt wird
+    conn = getattr(vc, "_connection", None)
+    if conn is not None and getattr(conn, "dave_protocol_version", 0) > 0:
+        for _ in range(15):
+            if getattr(conn, "can_encrypt", False):
+                break
+            await asyncio.sleep(0.1)
+        dave_ok = bool(getattr(conn, "can_encrypt", False))
+        print(
+            f"🔊 [Music] Verbunden mit Voice-Kanal #{target_channel.name} "
+            f"(DAVE-E2EE v{conn.dave_protocol_version}: {'✅ bereit' if dave_ok else '⏳ Handshake läuft'})"
+        )
+    else:
+        print(f"🔊 [Music] Verbunden mit Voice-Kanal #{target_channel.name} (Guild {guild.id})")
     return vc
 
 
