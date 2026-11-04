@@ -605,6 +605,7 @@ def _ensure_alerts_schema(d: dict[str, Any]) -> dict[str, Any]:
     tw.setdefault("last_announce_ts", 0.0)
     tw.setdefault("last_offline_ts", 0.0)
     tw.setdefault("active_message_id", 0)
+    tw.setdefault("active_player_message_id", 0)
     tw.setdefault("active_channel_id", 0)
     tw.setdefault("peak_viewers", 0)
     tw.setdefault("games", [])

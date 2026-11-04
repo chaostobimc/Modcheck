@@ -228,9 +228,18 @@ def _format_ping_text(ping_everyone: bool, ping_role_id: int) -> str:
     return " ".join(parts)
 
 
+def _playable_youtube_url(video: dict[str, Any]) -> str:
+    """Gibt eine watch?v=-URL zurück, damit Discord immer den echten abspielbaren Video-Player einbettet."""
+    vid_id = (video.get("video_id") or "").strip()
+    if vid_id:
+        return f"https://www.youtube.com/watch?v={vid_id}"
+    return str(video.get("url") or "")
+
+
 def build_twitch_live_embed(
     stream_info: dict[str, Any],
     profile: dict[str, Any] | None = None,
+    include_preview_image: bool = False,
 ) -> discord.Embed:
     channel_login = (STREAMER_CHANNEL or stream_info.get("user_login") or "twitch").lower()
     display_name = (
@@ -273,7 +282,7 @@ def build_twitch_live_embed(
     embed.add_field(name="🕐 Gestartet", value=started_val, inline=True)
 
     thumb_tpl = stream_info.get("thumbnail_url") or ""
-    if thumb_tpl:
+    if include_preview_image and thumb_tpl:
         preview_url = (
             thumb_tpl.replace("{width}", "1280").replace("{height}", "720")
             + f"?cb={int(time.time() // 300)}"
@@ -329,7 +338,10 @@ def build_twitch_offline_embed(
     return embed
 
 
-def build_youtube_upload_embed(video: dict[str, Any]) -> discord.Embed:
+def build_youtube_upload_embed(
+    video: dict[str, Any],
+    include_preview_image: bool = False,
+) -> discord.Embed:
     is_short = bool(video.get("is_short"))
     badge = "📱 Neuer YouTube-Short!" if is_short else "🎬 Neues YouTube-Video!"
     ch_name = video.get("channel_title") or "YouTube"
@@ -347,7 +359,10 @@ def build_youtube_upload_embed(video: dict[str, Any]) -> discord.Embed:
     embed.add_field(name="🎞️ Format", value="YouTube Short 📱" if is_short else "Video 🎬", inline=True)
     embed.add_field(name="🕐 Hochgeladen", value=f"<t:{pub_ts}:R>", inline=True)
     if video.get("thumbnail"):
-        embed.set_image(url=video["thumbnail"])
+        if include_preview_image:
+            embed.set_image(url=video["thumbnail"])
+        else:
+            embed.set_thumbnail(url=video["thumbnail"])
     embed.set_footer(text="YouTube Upload-Alert")
     return embed
 
@@ -473,22 +488,28 @@ class AlertsCog(commands.Cog, name="Alerts"):
                     target_ch = self._resolve_text_channel(int(cfg.get("live_channel_id") or 0))
                     if target_ch is not None:
                         profile = await fetch_streamer_profile()
-                        embed = build_twitch_live_embed(info, profile)
+                        embed = build_twitch_live_embed(info, profile, include_preview_image=False)
                         ping_txt = _format_ping_text(
                             bool(cfg.get("live_ping_everyone")),
                             int(cfg.get("live_ping_role_id") or 0),
                         )
                         stream_url = f"https://www.twitch.tv/{STREAMER_CHANNEL.lower()}"
+                        # 1) Modcheck Info-Karte + Ping
                         msg = await target_ch.send(
                             content=ping_txt or None,
                             embed=embed,
-                            view=_make_link_view("Jetzt auf Twitch einschalten", stream_url, "🟣"),
                             allowed_mentions=discord.AllowedMentions(everyone=True, roles=True),
                         )
+                        # 2) Echter abspielbarer Discord Twitch-Stream-Player (ohne embeds=[], damit Discord die URL nativ einbettet!)
+                        player_msg = await target_ch.send(
+                            content=stream_url,
+                            view=_make_link_view("Jetzt auf Twitch einschalten", stream_url, "🟣"),
+                        )
                         tw["active_message_id"] = msg.id
+                        tw["active_player_message_id"] = player_msg.id
                         tw["active_channel_id"] = target_ch.id
                         self._last_live_card_edit = now_ts
-                        print(f"🔴 Twitch Live-Post gesendet in #{target_ch.name} (Stream-ID: {stream_id})")
+                        print(f"🔴 Twitch Live-Post + Stream-Embed gesendet in #{target_ch.name} (Stream-ID: {stream_id})")
 
                     save_alerts_state(state)
                     return
@@ -514,10 +535,15 @@ class AlertsCog(commands.Cog, name="Alerts"):
                         try:
                             msg = await active_ch.fetch_message(int(tw["active_message_id"]))
                             profile = await fetch_streamer_profile()
+                            has_player_msg = bool(tw.get("active_player_message_id"))
                             stream_url = f"https://www.twitch.tv/{STREAMER_CHANNEL.lower()}"
                             await msg.edit(
-                                embed=build_twitch_live_embed(info, profile),
-                                view=_make_link_view("Jetzt auf Twitch einschalten", stream_url, "🟣"),
+                                embed=build_twitch_live_embed(
+                                    info,
+                                    profile,
+                                    include_preview_image=not has_player_msg,
+                                ),
+                                view=None if has_player_msg else _make_link_view("Jetzt auf Twitch einschalten", stream_url, "🟣"),
                             )
                             self._last_live_card_edit = now_ts
                         except Exception:
@@ -536,21 +562,29 @@ class AlertsCog(commands.Cog, name="Alerts"):
                     tw["is_live"] = False
                     tw["last_offline_ts"] = now_ts
 
-                    if tw.get("active_message_id") and tw.get("active_channel_id"):
+                    if tw.get("active_channel_id"):
                         active_ch = self._resolve_text_channel(int(tw["active_channel_id"]))
                         if active_ch is not None:
-                            try:
-                                msg = await active_ch.fetch_message(int(tw["active_message_id"]))
-                                profile = await fetch_streamer_profile()
-                                stream_url = f"https://www.twitch.tv/{STREAMER_CHANNEL.lower()}"
-                                await msg.edit(
-                                    content=None,
-                                    embed=build_twitch_offline_embed(tw, profile),
-                                    view=_make_link_view("Kanal & VODs auf Twitch", stream_url, "📺"),
-                                )
-                            except Exception:
-                                pass
+                            if tw.get("active_message_id"):
+                                try:
+                                    msg = await active_ch.fetch_message(int(tw["active_message_id"]))
+                                    profile = await fetch_streamer_profile()
+                                    stream_url = f"https://www.twitch.tv/{STREAMER_CHANNEL.lower()}"
+                                    await msg.edit(
+                                        content=None,
+                                        embed=build_twitch_offline_embed(tw, profile),
+                                        view=_make_link_view("Kanal & VODs auf Twitch", stream_url, "📺"),
+                                    )
+                                except Exception:
+                                    pass
+                            if tw.get("active_player_message_id"):
+                                try:
+                                    pmsg = await active_ch.fetch_message(int(tw["active_player_message_id"]))
+                                    await pmsg.delete()
+                                except Exception:
+                                    pass
                     tw["active_message_id"] = 0
+                    tw["active_player_message_id"] = 0
                     tw["active_channel_id"] = 0
                     save_alerts_state(state)
 
@@ -623,13 +657,18 @@ class AlertsCog(commands.Cog, name="Alerts"):
             for vid in new_videos:
                 seen.append(vid["video_id"])
                 if target_ch is not None:
+                    # 1) Modcheck Info-Karte + optionaler Ping
                     await target_ch.send(
                         content=ping_txt or None,
-                        embed=build_youtube_upload_embed(vid),
-                        view=_make_link_view("Jetzt auf YouTube ansehen", vid["url"], "▶️"),
+                        embed=build_youtube_upload_embed(vid, include_preview_image=False),
                         allowed_mentions=discord.AllowedMentions(everyone=True, roles=True),
                     )
-                    print(f"🎬 YouTube-Upload angekündigt: {vid['title']} ({vid['video_id']})")
+                    # 2) Echter in Discord abspielbarer YouTube-Video-Player + Direkt-Button
+                    await target_ch.send(
+                        content=_playable_youtube_url(vid),
+                        view=_make_link_view("Jetzt auf YouTube ansehen", vid["url"], "▶️"),
+                    )
+                    print(f"🎬 YouTube-Upload + Video-Embed angekündigt: {vid['title']} ({vid['video_id']})")
 
             yt["seen_video_ids"] = seen[-200:]
             save_alerts_state(state)
@@ -981,7 +1020,10 @@ class AlertsCog(commands.Cog, name="Alerts"):
         name="testalert",
         description="🧪 Sendet eine Vorschau für Twitch-Live, YouTube-Upload oder Inaktivitäts-Warnung",
     )
-    @app_commands.describe(typ="Welchen Alert möchtest du testen?")
+    @app_commands.describe(
+        typ="Welchen Alert möchtest du testen?",
+        im_kanal_posten="True = 1:1 im aktuellen Kanal posten (ohne Ping), damit Discord den echten Video/Stream-Player anzeigt",
+    )
     @app_commands.choices(
         typ=[
             app_commands.Choice(name="🟣 Twitch „JETZT LIVE“-Post", value="twitch"),
@@ -990,7 +1032,12 @@ class AlertsCog(commands.Cog, name="Alerts"):
         ]
     )
     @is_admin_user()
-    async def cmd_testalert(self, interaction: discord.Interaction, typ: str) -> None:
+    async def cmd_testalert(
+        self,
+        interaction: discord.Interaction,
+        typ: str,
+        im_kanal_posten: bool = False,
+    ) -> None:
         await interaction.response.defer(ephemeral=True)
         state = load_alerts_state()
         cfg = state["config"]
@@ -1008,14 +1055,29 @@ class AlertsCog(commands.Cog, name="Alerts"):
                 "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                 "thumbnail_url": "",
             }
-            embed = build_twitch_live_embed(fake_or_real, profile)
+            embed = build_twitch_live_embed(fake_or_real, profile, include_preview_image=False)
             stream_url = f"https://www.twitch.tv/{(STREAMER_CHANNEL or 'twitch').lower()}"
-            await interaction.followup.send(
-                content="🧪 **Vorschau (nur für dich sichtbar):**",
-                embed=embed,
-                view=_make_link_view("Jetzt auf Twitch einschalten", stream_url, "🟣"),
-                ephemeral=True,
-            )
+            if im_kanal_posten and isinstance(interaction.channel, discord.abc.Messageable):
+                await interaction.channel.send(embed=embed)
+                await interaction.channel.send(
+                    content=stream_url,
+                    view=_make_link_view("Jetzt auf Twitch einschalten", stream_url, "🟣"),
+                )
+                await interaction.followup.send(
+                    "✅ **Test-Post inkl. nativem Twitch-Stream-Embed** wurde im Kanal gesendet *(ohne Ping)*!",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    content="🧪 **Vorschau (nur für dich sichtbar):**",
+                    embed=embed,
+                    ephemeral=True,
+                )
+                await interaction.followup.send(
+                    content=stream_url,
+                    view=_make_link_view("Jetzt auf Twitch einschalten", stream_url, "🟣"),
+                    ephemeral=True,
+                )
             return
 
         if typ == "youtube":
@@ -1036,12 +1098,30 @@ class AlertsCog(commands.Cog, name="Alerts"):
                 )
                 return
             latest = entries[-1]
-            await interaction.followup.send(
-                content="🧪 **Vorschau mit dem aktuell neuesten Video (nur für dich sichtbar):**",
-                embed=build_youtube_upload_embed(latest),
-                view=_make_link_view("Jetzt auf YouTube ansehen", latest["url"], "▶️"),
-                ephemeral=True,
-            )
+            playable_url = _playable_youtube_url(latest)
+            if im_kanal_posten and isinstance(interaction.channel, discord.abc.Messageable):
+                await interaction.channel.send(
+                    embed=build_youtube_upload_embed(latest, include_preview_image=False),
+                )
+                await interaction.channel.send(
+                    content=playable_url,
+                    view=_make_link_view("Jetzt auf YouTube ansehen", latest["url"], "▶️"),
+                )
+                await interaction.followup.send(
+                    "✅ **Test-Post inkl. direkt abspielbarem YouTube-Video-Embed** wurde im Kanal gesendet *(ohne Ping)*!",
+                    ephemeral=True,
+                )
+            else:
+                await interaction.followup.send(
+                    content="🧪 **Vorschau mit dem aktuell neuesten Video (nur für dich sichtbar):**",
+                    embed=build_youtube_upload_embed(latest, include_preview_image=False),
+                    ephemeral=True,
+                )
+                await interaction.followup.send(
+                    content=playable_url,
+                    view=_make_link_view("Jetzt auf YouTube ansehen", latest["url"], "▶️"),
+                    ephemeral=True,
+                )
             return
 
         # Inaktivitäts-Check Vorschau
