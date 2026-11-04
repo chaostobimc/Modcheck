@@ -6,79 +6,21 @@ Startpunkt für lokales Ausführen sowie für den Raspberry Pi 5 systemd-Dienst:
 from __future__ import annotations
 
 import asyncio
-import importlib
-import importlib.metadata
 import importlib.util
 import shutil
-import subprocess
 import sys
 import traceback
-
-
-def _parse_ver(v_str: str) -> tuple[int, int, int]:
-    parts: list[int] = []
-    for chunk in v_str.split(".")[:3]:
-        digits = "".join(ch for ch in chunk if ch.isdigit())
-        parts.append(int(digits) if digits else 0)
-    while len(parts) < 3:
-        parts.append(0)
-    return (parts[0], parts[1], parts[2])
-
-
-def _ensure_compatible_voice_deps() -> None:
-    """
-    Stellt vor dem Import von `discord` sicher, dass `discord.py >= 2.7.1` mit `davey 0.1.7`
-    läuft (`davey >= 0.2.0` hat Breaking-Changes in process_welcome/process_proposals, wodurch
-    der Bot zwar grün leuchtet, Discord aber unverschlüsselte Audio-Frames stumm verwirft).
-    """
-    if os.environ.get("MODCHECK_SKIP_VOICE_AUTOFIX") == "1":
-        return
-    try:
-        dpy_ver_str = importlib.metadata.version("discord.py")
-    except importlib.metadata.PackageNotFoundError:
-        return  # Isolierte Testumgebung ohne installiertes discord.py
-
-    dpy_ver = _parse_ver(dpy_ver_str)
-    try:
-        davey_ver_str: str | None = importlib.metadata.version("davey")
-        davey_ver = _parse_ver(davey_ver_str)
-    except importlib.metadata.PackageNotFoundError:
-        davey_ver_str = None
-        davey_ver = (0, 0, 0)
-
-    needs_dpy_upgrade = dpy_ver < (2, 7, 1)
-    needs_davey_fix = davey_ver_str is None or (dpy_ver < (2, 8, 0) and davey_ver >= (0, 2, 0)) or davey_ver < (0, 1, 7)
-
-    if not needs_dpy_upgrade and not needs_davey_fix:
-        return
-
-    pkgs: list[str] = ["davey==0.1.7"]
-    if needs_dpy_upgrade:
-        pkgs.insert(0, "discord.py>=2.7.1,<2.8.0")
-    if importlib.util.find_spec("nacl") is None:
-        pkgs.append("PyNaCl>=1.5.0")
-
-    print(
-        f"🔧 [Voice-AutoFix] discord.py={dpy_ver_str}, davey={davey_ver_str or 'fehlt'} erkannt "
-        f"– installiere kompatible Pakete ({', '.join(pkgs)}) in {sys.executable} ..."
-    )
-    cmd = [sys.executable, "-m", "pip", "install", "--disable-pip-version-check", *pkgs]
-    rc = subprocess.call(cmd)
-    if rc != 0:
-        rc = subprocess.call([*cmd, "--break-system-packages"])
-    importlib.invalidate_caches()
-    if rc == 0:
-        print("✅ [Voice-AutoFix] Kompatible Discord-Voice-Pakete erfolgreich eingerichtet!")
-    else:
-        print(f"⚠️ [Voice-AutoFix] Automatische Installation meldete Code {rc} – bitte manuell prüfen.")
-
-
-import os
-_ensure_compatible_voice_deps()
 
 import discord
 from discord import app_commands
 from discord.ext import commands
+
+# Umgeht den discord.py 2.7.x DAVE-Bug (#10549: grüner Redekreis ohne Ton) und nutzt den bewährten Transport-Modus
+try:
+    import discord.voice_state as _dvs
+    _dvs.has_dave = False
+except Exception:
+    pass
 
 from bot_core.config import (
     ADMIN_USER_IDS,
@@ -114,18 +56,6 @@ def check_system_requirements() -> bool:
         print("  🔐 PyNaCl:  ✅ Voice-Verschlüsselung bereit")
     else:
         print("  🔐 PyNaCl:  ❌ fehlt – pip install PyNaCl")
-
-    if importlib.util.find_spec("davey") is not None:
-        try:
-            dv = importlib.metadata.version("davey")
-        except Exception:
-            dv = "installiert"
-        print(f"  🛡️ DAVE:    ✅ davey {dv} + discord.py {discord.__version__} bereit")
-    else:
-        print(
-            f"  🛡️ DAVE:    ⚠️ 'davey' fehlt (discord.py {discord.__version__}) – "
-            "bitte ausführen: pip install 'discord.py>=2.7.1,<2.8.0' 'davey==0.1.7'"
-        )
 
     try:
         import yt_dlp
