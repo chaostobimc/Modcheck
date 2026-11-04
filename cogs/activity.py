@@ -44,10 +44,14 @@ from bot_core.config import (
 from bot_core.storage import (
     add_absence,
     add_absence_range,
+    get_clip_tracker_state,
     get_user_absences,
+    is_review_already_sent,
     is_user_absent,
     load_data,
+    mark_review_already_sent,
     remove_absence,
+    save_clip_tracker_state,
     save_data,
 )
 from bot_core.twitch_service import (
@@ -366,10 +370,10 @@ class ActivityCog(commands.Cog, name="Activity"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
-        self._review_sent: set[str] = set()
         self._stream_was_live: bool = False
-        self._known_clip_ids: set[str] = set()
-        self._clips_initialized: bool = False
+        init_flag, saved_clips = get_clip_tracker_state()
+        self._clips_initialized: bool = init_flag
+        self._known_clip_ids: set[str] = saved_clips
 
     async def cog_load(self) -> None:
         self.review_scheduler.start()
@@ -393,10 +397,10 @@ class ActivityCog(commands.Cog, name="Activity"):
 
         if today.day == last_day and now_de.hour == 22 and now_de.minute == 0:
             key = f"m-{today.year}-{today.month}"
-            if key not in self._review_sent:
+            if not is_review_already_sent(key):
                 channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
                 if channel and getattr(channel, "guild", None):
-                    self._review_sent.add(key)
+                    mark_review_already_sent(key)
                     try:
                         await send_monthly_review(channel, channel.guild, today.year, today.month)
                     except Exception as e:
@@ -404,10 +408,10 @@ class ActivityCog(commands.Cog, name="Activity"):
 
         if today.month == 12 and today.day == 1 and now_de.hour == 22 and now_de.minute == 0:
             key = f"y-{today.year}"
-            if key not in self._review_sent:
+            if not is_review_already_sent(key):
                 channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
                 if channel and getattr(channel, "guild", None):
-                    self._review_sent.add(key)
+                    mark_review_already_sent(key)
                     try:
                         await send_yearly_review(channel, channel.guild, today.year)
                     except Exception as e:
@@ -453,11 +457,13 @@ class ActivityCog(commands.Cog, name="Activity"):
                 if c.get("id"):
                     self._known_clip_ids.add(c["id"])
             self._clips_initialized = True
+            save_clip_tracker_state(True, self._known_clip_ids)
             return
 
         new_clips = [c for c in clips if c.get("id") and c["id"] not in self._known_clip_ids]
         for clip in reversed(new_clips):
             self._known_clip_ids.add(clip["id"])
+            save_clip_tracker_state(True, self._known_clip_ids)
             clip_title = clip.get("title", "Neuer Clip")
             clip_url = clip.get("url", "")
             creator = clip.get("creator_name", "Unbekannt")

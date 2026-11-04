@@ -32,6 +32,7 @@ logs/
 *.db
 user_prefs.json
 alerts_state.json
+runtime_state.json
 
 # Node.js (falls du Discord.js oder Frontend-Tools nutzt)
 node_modules/

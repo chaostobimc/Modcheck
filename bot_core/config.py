@@ -41,6 +41,7 @@ ABSENCE_FILE = os.path.join(BASE_DIR, "absences.json")
 STATS_FILE = os.path.join(BASE_DIR, "dashboard_stats.json")
 PREFS_FILE = os.path.join(BASE_DIR, "user_prefs.json")
 ALERTS_FILE = os.path.join(BASE_DIR, "alerts_state.json")
+RUNTIME_STATE_FILE = os.path.join(BASE_DIR, "runtime_state.json")
 
 
 def _env_int(name: str, default: int = 0) -> int:

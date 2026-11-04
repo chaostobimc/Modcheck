@@ -6,7 +6,7 @@ import datetime
 import re
 from typing import Any
 import discord
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from bot_core.config import (
     ADMIN_ROLE_NAME,
@@ -19,11 +19,22 @@ from bot_core.stats import stats_tracker
 from bot_core.storage import (
     clear_temp_voice_prefs,
     get_temp_voice_prefs,
+    load_temp_voice_runtime,
+    save_temp_voice_runtime,
     update_temp_voice_prefs,
 )
 
 temp_voice_channels: dict[int, dict[str, Any]] = {}
 _owner_recovery: dict[int, dict[str, Any]] = {}
+_TOPIC_VC_ID_RE = re.compile(r"\|\s*VC-ID:\s*(\d+)")
+
+
+def _persist_temp_voice() -> None:
+    """Speichert alle aktiven Temp-Voice-Kanäle & Owner-Recoveries sofort auf die Festplatte."""
+    try:
+        save_temp_voice_runtime(temp_voice_channels, _owner_recovery)
+    except Exception as e:
+        print(f"⚠️ [TempVC] Konnte Laufzeit-Zustand nicht speichern: {e}")
 
 
 def _is_only_audio_state_change(before: discord.VoiceState, after: discord.VoiceState) -> bool:
@@ -46,6 +57,7 @@ def _record_owner_left(channel_id: int, owner_id: int) -> None:
         "original_owner_id": owner_id,
         "left_at": datetime.datetime.now(datetime.timezone.utc),
     }
+    _persist_temp_voice()
 
 
 def _check_owner_recovery(channel_id: int, member_id: int) -> bool:
@@ -56,11 +68,13 @@ def _check_owner_recovery(channel_id: int, member_id: int) -> bool:
     if elapsed <= OWNER_RECOVERY_WINDOW:
         return True
     _owner_recovery.pop(channel_id, None)
+    _persist_temp_voice()
     return False
 
 
 def _clear_owner_recovery(channel_id: int) -> None:
-    _owner_recovery.pop(channel_id, None)
+    if _owner_recovery.pop(channel_id, None) is not None:
+        _persist_temp_voice()
 
 
 def _slugify_channel_name(raw: str) -> str:
@@ -221,6 +235,7 @@ class SetLimitModal(discord.ui.Modal, title="Nutzer-Limit setzen"):
             update_temp_voice_prefs(interaction.user.id, limit=val)
             if self.voice_channel_id in temp_voice_channels:
                 temp_voice_channels[self.voice_channel_id]["limit"] = val
+                _persist_temp_voice()
             await interaction.response.send_message(
                 f"✅ Nutzer-Limit auf **{val if val > 0 else 'kein Limit'}** gesetzt *(gemerkt 💾)*!",
                 ephemeral=True,
@@ -296,6 +311,7 @@ class InviteUserSelectView(discord.ui.View):
             vc_data = temp_voice_channels.get(self.voice_channel_id)
             if vc_data:
                 vc_data["allowed_users"].add(member.id)
+                _persist_temp_voice()
                 tc = interaction.guild.get_channel(vc_data.get("text_channel_id", 0))
                 if isinstance(tc, discord.TextChannel):
                     await tc.set_permissions(member, read_messages=True, send_messages=True)
@@ -356,6 +372,7 @@ class TransferOwnerSelectView(discord.ui.View):
                     await tc.set_permissions(old_owner, read_messages=True, send_messages=True, manage_messages=False)
 
             vc_data["owner_id"] = new_owner.id
+            _persist_temp_voice()
             await interaction.response.edit_message(
                 content=f"👑 Admin-Rechte wurden an **{new_owner.display_name}** übertragen!", view=None
             )
@@ -387,6 +404,10 @@ class KickUserSelectView(discord.ui.View):
         try:
             await member.move_to(None, reason="Temp VC: Vom Kanal-Admin gekickt")
             await vc.set_permissions(member, connect=False)
+            vc_data = temp_voice_channels.get(self.voice_channel_id)
+            if vc_data and member.id in vc_data.get("allowed_users", set()):
+                vc_data["allowed_users"].discard(member.id)
+                _persist_temp_voice()
             await interaction.response.edit_message(
                 content=f"👢 **{member.display_name}** wurde aus dem Kanal gekickt!", view=None
             )
@@ -470,6 +491,7 @@ class VoiceChannelControlView(discord.ui.View):
                 await vc.set_permissions(interaction.guild.default_role, connect=False)
                 vc_data["locked"] = True
                 msg = "🔒 Kanal wurde **gesperrt**."
+            _persist_temp_voice()
             await interaction.response.send_message(msg, ephemeral=True)
             await update_temp_voice_panel(interaction.guild, vid)
         except Exception as e:
@@ -546,6 +568,7 @@ class VoiceChannelControlView(discord.ui.View):
         try:
             await vc.edit(name=default_name, user_limit=0, bitrate=default_bps)
             vc_data["limit"] = 0
+            _persist_temp_voice()
             tc = interaction.guild.get_channel(vc_data.get("text_channel_id", 0))
             if isinstance(tc, discord.TextChannel):
                 await tc.edit(name=f"💬{_slugify_channel_name(interaction.user.display_name)}s-kanal")
@@ -563,14 +586,192 @@ class VoiceChannelControlView(discord.ui.View):
 # ═══════════════════════════════════════════════════════════════════════════
 
 class TempVoiceCog(commands.Cog, name="TempVoice"):
-    """Temporäre Voice-Kanäle & globales Voice-Zeit-Tracking."""
+    """Temporäre Voice-Kanäle & globales Voice-Zeit-Tracking (100% neustartsicher)."""
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
         self.temp_voice_channels = temp_voice_channels
+        self._startup_reconciled: bool = False
 
     async def cog_load(self) -> None:
+        saved_ch, saved_rec = load_temp_voice_runtime()
+        temp_voice_channels.clear()
+        temp_voice_channels.update(saved_ch)
+        _owner_recovery.clear()
+        _owner_recovery.update(saved_rec)
         self.bot.add_view(VoiceChannelControlView(0, 0))
+        self.temp_voice_watchdog.start()
+
+    async def cog_unload(self) -> None:
+        if self.temp_voice_watchdog.is_running():
+            self.temp_voice_watchdog.cancel()
+        _persist_temp_voice()
+
+    async def _discover_untracked_temp_channels(self, guild: discord.Guild) -> bool:
+        """Erkennt auch Temp-Voice-Kanäle aus älteren Läufen anhand von '| VC-ID: <id>' im Textkanal-Topic."""
+        changed = False
+        for tc in list(getattr(guild, "text_channels", [])):
+            topic = getattr(tc, "topic", None) or ""
+            m = _TOPIC_VC_ID_RE.search(topic)
+            if not m:
+                continue
+            vid = int(m.group(1))
+            if vid in temp_voice_channels:
+                continue
+
+            vc = guild.get_channel(vid)
+            if not isinstance(vc, discord.VoiceChannel):
+                try:
+                    await tc.delete(reason="Temp Voice Cleanup: Zugehöriger Voice-Kanal existiert nicht mehr")
+                except Exception:
+                    pass
+                continue
+
+            humans = [mem for mem in vc.members if not mem.bot]
+            if not humans:
+                try:
+                    await vc.delete(reason="Temp Voice Cleanup: Kanal nach Neustart leer")
+                except Exception:
+                    pass
+                try:
+                    await tc.delete(reason="Temp Voice Cleanup: Kanal nach Neustart leer")
+                except Exception:
+                    pass
+                continue
+
+            # Aktiven Kanal adoptieren (Owner, Lock-Status & Panel-Message rekonstruieren)
+            inferred_owner = humans[0].id
+            for target, ow in vc.overwrites.items():
+                if isinstance(target, discord.Member) and not target.bot and ow.manage_channels is True:
+                    inferred_owner = target.id
+                    break
+            default_ow = vc.overwrites.get(guild.default_role)
+            is_locked = bool(default_ow and default_ow.connect is False)
+
+            ctrl_msg_id = 0
+            try:
+                pins = await tc.pins()
+                for p in pins:
+                    if p.author == guild.me:
+                        ctrl_msg_id = p.id
+                        break
+            except Exception:
+                pass
+
+            temp_voice_channels[vid] = {
+                "guild_id": guild.id,
+                "owner_id": inferred_owner,
+                "original_owner_id": inferred_owner,
+                "text_channel_id": tc.id,
+                "control_message_id": ctrl_msg_id,
+                "allowed_users": set(),
+                "locked": is_locked,
+                "limit": vc.user_limit,
+            }
+            changed = True
+            print(f"♻️ [TempVC] Bestehenden aktiven Kanal wiederhergestellt: {vc.name} ({vid})")
+        return changed
+
+    async def reconcile_temp_voices(self, initial: bool = False) -> None:
+        """Prüft alle gespeicherten & vorhandenen Temp-Voice-Kanäle und räumt leere sofort auf."""
+        changed = False
+        for guild in list(self.bot.guilds):
+            if await self._discover_untracked_temp_channels(guild):
+                changed = True
+
+            if initial:
+                # Laufende Voice-Sessions nach Neustart wieder ins Statistik-Tracking aufnehmen
+                for vch in getattr(guild, "voice_channels", []):
+                    for mem in vch.members:
+                        if not mem.bot:
+                            try:
+                                stats_tracker.voice_join(mem.id)
+                            except Exception:
+                                pass
+
+        for vid, vc_data in list(temp_voice_channels.items()):
+            guild: discord.Guild | None = None
+            gid = int(vc_data.get("guild_id") or 0)
+            if gid:
+                guild = self.bot.get_guild(gid)
+            if guild is None:
+                ch_obj = self.bot.get_channel(vid) or self.bot.get_channel(int(vc_data.get("text_channel_id") or 0))
+                guild = getattr(ch_obj, "guild", None)
+
+            if guild is None:
+                continue
+            if not vc_data.get("guild_id"):
+                vc_data["guild_id"] = guild.id
+                changed = True
+
+            vc = guild.get_channel(vid)
+            if not isinstance(vc, discord.VoiceChannel):
+                tc = guild.get_channel(int(vc_data.get("text_channel_id") or 0))
+                if tc is not None:
+                    try:
+                        await tc.delete(reason="Temp Voice: Zugehöriger Voice-Kanal gelöscht")
+                    except Exception:
+                        pass
+                temp_voice_channels.pop(vid, None)
+                _owner_recovery.pop(vid, None)
+                changed = True
+                continue
+
+            humans = [m for m in vc.members if not m.bot]
+            if not humans:
+                _clear_owner_recovery(vid)
+                await self._delete_temp_vc(vid, guild)
+                continue
+
+            # Falls der bisherige Owner während des Neustarts gegangen ist -> nächster User übernimmt
+            owner_id = int(vc_data.get("owner_id") or 0)
+            if all(m.id != owner_id for m in humans):
+                new_owner = humans[0]
+                if owner_id:
+                    _record_owner_left(vid, owner_id)
+                vc_data["owner_id"] = new_owner.id
+                changed = True
+                try:
+                    await vc.set_permissions(
+                        new_owner,
+                        manage_channels=True, connect=True, speak=True,
+                        move_members=True, mute_members=True, deafen_members=True,
+                    )
+                    tc = guild.get_channel(int(vc_data.get("text_channel_id") or 0))
+                    if isinstance(tc, discord.TextChannel):
+                        await tc.set_permissions(new_owner, read_messages=True, send_messages=True, manage_messages=True)
+                except Exception:
+                    pass
+
+            if initial:
+                await update_temp_voice_panel(guild, vid)
+
+        # Falls während des Neustarts jemand im Trigger-Kanal wartet -> sofort Temp-VC erstellen
+        if initial and TEMP_VOICE_CHANNEL_ID:
+            for guild in list(self.bot.guilds):
+                trig = guild.get_channel(TEMP_VOICE_CHANNEL_ID)
+                if isinstance(trig, discord.VoiceChannel):
+                    for mem in list(trig.members):
+                        if not mem.bot:
+                            await self._create_temp_vc(mem, guild)
+
+        if changed:
+            _persist_temp_voice()
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        if not self._startup_reconciled:
+            self._startup_reconciled = True
+            await self.reconcile_temp_voices(initial=True)
+
+    @tasks.loop(seconds=30)
+    async def temp_voice_watchdog(self) -> None:
+        if self._startup_reconciled:
+            await self.reconcile_temp_voices(initial=False)
+
+    @temp_voice_watchdog.before_loop
+    async def _before_temp_voice_watchdog(self) -> None:
+        await self.bot.wait_until_ready()
 
     async def _create_temp_vc(self, member: discord.Member, guild: discord.Guild) -> None:
         try:
@@ -642,6 +843,7 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
             )
 
             temp_voice_channels[vc.id] = {
+                "guild_id": guild.id,
                 "owner_id": member.id,
                 "original_owner_id": member.id,
                 "text_channel_id": tc.id,
@@ -650,6 +852,7 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                 "locked": False,
                 "limit": saved_limit,
             }
+            _persist_temp_voice()
 
             try:
                 await member.move_to(vc)
@@ -665,6 +868,7 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                 view=VoiceChannelControlView(member.id, vc.id),
             )
             temp_voice_channels[vc.id]["control_message_id"] = msg.id
+            _persist_temp_voice()
             try:
                 await msg.pin()
             except discord.HTTPException:
@@ -674,6 +878,8 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
 
     async def _delete_temp_vc(self, voice_channel_id: int, guild: discord.Guild) -> None:
         vc_data = temp_voice_channels.pop(voice_channel_id, None)
+        _owner_recovery.pop(voice_channel_id, None)
+        _persist_temp_voice()
         if not vc_data:
             return
 
@@ -699,7 +905,8 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
             vc = guild.get_channel(channel_id)
 
         if vc is None or not isinstance(vc, discord.VoiceChannel):
-            temp_voice_channels.pop(channel_id, None)
+            if temp_voice_channels.pop(channel_id, None) is not None:
+                _persist_temp_voice()
             return
 
         human_members = [m for m in vc.members if not m.bot]
@@ -728,6 +935,7 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                         f"-# Der vorherige Admin kann innerhalb von 10 Min. zurückkehren, um den Rang zurückzuerhalten."
                     )
                 vc_data["owner_id"] = new_owner.id
+                _persist_temp_voice()
             except Exception as e:
                 print(f"⚠️ [TempVC] Ownership-Transfer Fehler: {e}")
 
@@ -821,6 +1029,7 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                                     f"👑 **{member.mention}** ist zurückgekehrt und hat den Kanal-Admin-Rang zurückerhalten!"
                                 )
                             vc_data["owner_id"] = member.id
+                            _persist_temp_voice()
                         except Exception as e:
                             print(f"⚠️ [TempVC] Owner-Recovery Fehler: {e}")
 

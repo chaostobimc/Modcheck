@@ -22,6 +22,7 @@ from bot_core.config import (
     LIVE_PING_EVERYONE,
     LIVE_PING_ROLE_ID,
     PREFS_FILE,
+    RUNTIME_STATE_FILE,
     START_BALANCE,
     TICKET_DATA_FILE,
     VAULT_FILE,
@@ -451,6 +452,7 @@ def _get_prefs_unlocked() -> dict[str, Any]:
             raw = {}
         raw.setdefault("favorites", {})
         raw.setdefault("guild_volumes", {})
+        raw.setdefault("guild_music_prefs", {})
         raw.setdefault("temp_voice", {})
         _prefs_cache = raw
     return _prefs_cache
@@ -540,6 +542,34 @@ def set_guild_volume(guild_id: int, percent: int) -> int:
         prefs["guild_volumes"][str(guild_id)] = clamped
         _save_prefs_unlocked()
     return clamped
+
+
+def get_guild_music_prefs(guild_id: int) -> dict[str, Any]:
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        entry = prefs.get("guild_music_prefs", {}).get(str(guild_id), {})
+        if not isinstance(entry, dict):
+            entry = {}
+        return {
+            "autoplay": bool(entry.get("autoplay", False)),
+            "loop_mode": str(entry.get("loop_mode", "off"))
+            if entry.get("loop_mode") in ("off", "track", "queue")
+            else "off",
+        }
+
+
+def set_guild_music_prefs(guild_id: int, **kwargs: Any) -> None:
+    with _prefs_lock:
+        prefs = _get_prefs_unlocked()
+        gid = str(guild_id)
+        entry = prefs.setdefault("guild_music_prefs", {}).setdefault(gid, {})
+        if not isinstance(entry, dict):
+            entry = {}
+            prefs["guild_music_prefs"][gid] = entry
+        for k, v in kwargs.items():
+            if v is not None:
+                entry[k] = v
+        _save_prefs_unlocked()
 
 
 # ── Temp-Voice Gedächtnis (pro User) ───────────────────────────────────────
@@ -634,4 +664,266 @@ def save_alerts_state(data: dict[str, Any]) -> None:
     with _alerts_lock:
         _alerts_cache = _ensure_alerts_schema(copy.deepcopy(data))
         _atomic_write_json(ALERTS_FILE, _alerts_cache)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 8. NEUSTART-SICHERER LAUFZEIT-SPEICHER (runtime_state.json)
+#    Temp-Voice, Reminder, Clip- & Review-Tracker, Aktive Musik & Casino-Escrow
+# ═══════════════════════════════════════════════════════════════════════════
+_runtime_lock = threading.RLock()
+_runtime_cache: dict[str, Any] | None = None
+
+
+def _ensure_runtime_schema(d: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(d, dict):
+        d = {}
+    d.setdefault("temp_voice_channels", {})
+    d.setdefault("temp_voice_recovery", {})
+    d.setdefault("reminders", [])
+    d.setdefault("reviews_sent", [])
+    clips = d.setdefault("clip_tracker", {})
+    clips.setdefault("initialized", False)
+    clips.setdefault("known_ids", [])
+    d.setdefault("music_sessions", {})
+    d.setdefault("casino_escrow", {})
+    return d
+
+
+def _get_runtime_unlocked() -> dict[str, Any]:
+    global _runtime_cache
+    if _runtime_cache is None:
+        _runtime_cache = _ensure_runtime_schema(_read_json(RUNTIME_STATE_FILE, {}))
+    return _runtime_cache
+
+
+def _save_runtime_unlocked() -> None:
+    if _runtime_cache is not None:
+        _atomic_write_json(RUNTIME_STATE_FILE, _runtime_cache)
+
+
+# ── Temp-Voice Laufzeit-Persistenz ─────────────────────────────────────────
+
+def save_temp_voice_runtime(
+    channels: dict[int, dict[str, Any]],
+    recovery: dict[int, dict[str, Any]],
+) -> None:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        ser_ch: dict[str, Any] = {}
+        for vid, vdata in channels.items():
+            ser_ch[str(vid)] = {
+                "guild_id": int(vdata.get("guild_id") or 0),
+                "owner_id": int(vdata.get("owner_id") or 0),
+                "original_owner_id": int(vdata.get("original_owner_id") or vdata.get("owner_id") or 0),
+                "text_channel_id": int(vdata.get("text_channel_id") or 0),
+                "control_message_id": int(vdata.get("control_message_id") or 0),
+                "allowed_users": sorted(int(u) for u in (vdata.get("allowed_users") or [])),
+                "locked": bool(vdata.get("locked", False)),
+                "limit": int(vdata.get("limit") or 0),
+            }
+        ser_rec: dict[str, Any] = {}
+        for vid, rdata in recovery.items():
+            left_at = rdata.get("left_at")
+            iso_ts = (
+                left_at.isoformat()
+                if isinstance(left_at, datetime.datetime)
+                else str(left_at or "")
+            )
+            ser_rec[str(vid)] = {
+                "original_owner_id": int(rdata.get("original_owner_id") or 0),
+                "left_at": iso_ts,
+            }
+        rt["temp_voice_channels"] = ser_ch
+        rt["temp_voice_recovery"] = ser_rec
+        _save_runtime_unlocked()
+
+
+def load_temp_voice_runtime() -> tuple[dict[int, dict[str, Any]], dict[int, dict[str, Any]]]:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        channels: dict[int, dict[str, Any]] = {}
+        for vid_s, vdata in (rt.get("temp_voice_channels") or {}).items():
+            try:
+                vid = int(vid_s)
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(vdata, dict):
+                continue
+            channels[vid] = {
+                "guild_id": int(vdata.get("guild_id") or 0),
+                "owner_id": int(vdata.get("owner_id") or 0),
+                "original_owner_id": int(vdata.get("original_owner_id") or vdata.get("owner_id") or 0),
+                "text_channel_id": int(vdata.get("text_channel_id") or 0),
+                "control_message_id": int(vdata.get("control_message_id") or 0),
+                "allowed_users": {int(u) for u in (vdata.get("allowed_users") or [])},
+                "locked": bool(vdata.get("locked", False)),
+                "limit": int(vdata.get("limit") or 0),
+            }
+        recovery: dict[int, dict[str, Any]] = {}
+        for vid_s, rdata in (rt.get("temp_voice_recovery") or {}).items():
+            try:
+                vid = int(vid_s)
+                dt = datetime.datetime.fromisoformat(str(rdata.get("left_at") or ""))
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=datetime.timezone.utc)
+                recovery[vid] = {
+                    "original_owner_id": int(rdata.get("original_owner_id") or 0),
+                    "left_at": dt,
+                }
+            except Exception:
+                continue
+        return channels, recovery
+
+
+# ── Persistente Reminder (/remind) ─────────────────────────────────────────
+
+def add_persistent_reminder(
+    user_id: int,
+    channel_id: int,
+    due_ts: float,
+    message: str,
+) -> str:
+    rid = f"{int(time.time() * 1000)}_{random.randint(1000, 9999)}"
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        rt["reminders"].append(
+            {
+                "id": rid,
+                "user_id": int(user_id),
+                "channel_id": int(channel_id or 0),
+                "due_ts": float(due_ts),
+                "created_ts": time.time(),
+                "message": str(message),
+            }
+        )
+        _save_runtime_unlocked()
+    return rid
+
+
+def pop_due_reminders(now_ts: float | None = None) -> list[dict[str, Any]]:
+    now_val = time.time() if now_ts is None else now_ts
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        due: list[dict[str, Any]] = []
+        remaining: list[dict[str, Any]] = []
+        for r in rt.get("reminders") or []:
+            if not isinstance(r, dict):
+                continue
+            if float(r.get("due_ts") or 0) <= now_val:
+                due.append(copy.deepcopy(r))
+            else:
+                remaining.append(r)
+        if due:
+            rt["reminders"] = remaining
+            _save_runtime_unlocked()
+        return due
+
+
+# ── Review- & Clip-Tracker Persistenz ──────────────────────────────────────
+
+def is_review_already_sent(key: str) -> bool:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        return key in (rt.get("reviews_sent") or [])
+
+
+def mark_review_already_sent(key: str) -> None:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        sent: list[str] = rt.setdefault("reviews_sent", [])
+        if key not in sent:
+            sent.append(key)
+            rt["reviews_sent"] = sent[-60:]
+            _save_runtime_unlocked()
+
+
+def get_clip_tracker_state() -> tuple[bool, set[str]]:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        ct = rt.get("clip_tracker") or {}
+        return bool(ct.get("initialized", False)), set(ct.get("known_ids") or [])
+
+
+def save_clip_tracker_state(initialized: bool, known_ids: set[str]) -> None:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        rt["clip_tracker"] = {
+            "initialized": bool(initialized),
+            "known_ids": list(known_ids)[-300:],
+        }
+        _save_runtime_unlocked()
+
+
+# ── Aktive Musik-Sitzungen (Auto-Resume nach Neustart) ─────────────────────
+
+def save_active_music_session(guild_id: int, payload: dict[str, Any]) -> None:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        rt["music_sessions"][str(guild_id)] = copy.deepcopy(payload)
+        _save_runtime_unlocked()
+
+
+def clear_active_music_session(guild_id: int) -> None:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        if rt.get("music_sessions", {}).pop(str(guild_id), None) is not None:
+            _save_runtime_unlocked()
+
+
+def load_active_music_sessions() -> dict[int, dict[str, Any]]:
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        out: dict[int, dict[str, Any]] = {}
+        for gid_s, val in (rt.get("music_sessions") or {}).items():
+            try:
+                out[int(gid_s)] = copy.deepcopy(val)
+            except (TypeError, ValueError):
+                continue
+        return out
+
+
+# ── Casino Einsatz-Schutz (Auto-Refund falls Neustart mitten im Spiel) ─────
+
+def register_bet_escrow(user_id: int, amount: int, game_name: str) -> str:
+    if amount <= 0:
+        return ""
+    eid = f"{user_id}_{int(time.time() * 1000)}_{random.randint(100, 999)}"
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        rt["casino_escrow"][eid] = {
+            "user_id": int(user_id),
+            "amount": int(amount),
+            "game": str(game_name),
+            "ts": time.time(),
+        }
+        _save_runtime_unlocked()
+    return eid
+
+
+def release_bet_escrow(escrow_id: str) -> None:
+    if not escrow_id:
+        return
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        if rt.get("casino_escrow", {}).pop(escrow_id, None) is not None:
+            _save_runtime_unlocked()
+
+
+def refund_interrupted_escrows() -> list[dict[str, Any]]:
+    """Erstattet beim Bot-Start alle offenen Einsätze aus durch Neustart abgebrochenen Spielen."""
+    with _runtime_lock:
+        rt = _get_runtime_unlocked()
+        escrows = rt.get("casino_escrow") or {}
+        if not escrows:
+            return []
+        refunded: list[dict[str, Any]] = []
+        for entry in escrows.values():
+            if isinstance(entry, dict) and int(entry.get("amount") or 0) > 0:
+                uid = int(entry["user_id"])
+                amt = int(entry["amount"])
+                update_balance(uid, amt)
+                refunded.append(copy.deepcopy(entry))
+        rt["casino_escrow"] = {}
+        _save_runtime_unlocked()
+        return refunded
 

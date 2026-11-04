@@ -30,9 +30,14 @@ from bot_core.config import (
     runtime_settings,
 )
 from bot_core.storage import (
+    clear_active_music_session,
+    get_guild_music_prefs,
     get_guild_volume,
     get_user_favorites,
+    load_active_music_sessions,
     remove_user_favorite,
+    save_active_music_session,
+    set_guild_music_prefs,
     set_guild_volume,
     toggle_user_favorite,
 )
@@ -199,8 +204,9 @@ class GuildMusicState:
         self.voice_client: discord.VoiceClient | None = None
         self.text_channel: discord.abc.Messageable | None = None
         self.last_np_message: discord.Message | None = None
-        self.autoplay: bool = False
-        self.loop_mode: str = "off"  # "off" | "track" | "queue"
+        mprefs = get_guild_music_prefs(guild_id)
+        self.autoplay: bool = bool(mprefs.get("autoplay", False))
+        self.loop_mode: str = str(mprefs.get("loop_mode", "off"))
         self.volume_pct: int = get_guild_volume(guild_id)
         self.history: deque[str] = deque(maxlen=15)
         self.is_loading: bool = False
@@ -209,6 +215,49 @@ class GuildMusicState:
         self._stale_current_seconds: int = 0
         self._lock = asyncio.Lock()
         self.consecutive_failures: int = 0
+
+    @staticmethod
+    def _serialize_song(s: SongInfo) -> dict[str, Any]:
+        return {
+            "title": s.title,
+            "url": s.url if s.is_radio else "",
+            "webpage_url": s.webpage_url or s.url,
+            "duration": int(s.duration or 0),
+            "thumbnail": s.thumbnail or "",
+            "is_radio": bool(s.is_radio),
+        }
+
+    @staticmethod
+    def _deserialize_song(d: dict[str, Any]) -> SongInfo:
+        is_rad = bool(d.get("is_radio", False))
+        wurl = str(d.get("webpage_url") or d.get("url") or "")
+        return SongInfo(
+            title=str(d.get("title") or "Unbekannt"),
+            url=str(d.get("url") or wurl) if is_rad else "",
+            webpage_url=wurl,
+            duration=int(d.get("duration") or 0),
+            thumbnail=str(d.get("thumbnail") or ""),
+            is_radio=is_rad,
+        )
+
+    def persist_session(self) -> None:
+        """Sichert den aktuellen Song/Radiosender & die Queue für nahtlosen Auto-Resume nach Neustarts."""
+        guild = self.bot.get_guild(self.guild_id)
+        vc = self.voice_client or (guild.voice_client if guild else None)
+        vc_ch = vc.channel if (vc and vc.is_connected() and vc.channel) else None
+        if vc_ch is None or (self.current is None and not self.queue):
+            clear_active_music_session(self.guild_id)
+            return
+        tc_id = getattr(self.text_channel, "id", 0) or 0
+        save_active_music_session(
+            self.guild_id,
+            {
+                "voice_channel_id": vc_ch.id,
+                "text_channel_id": int(tc_id),
+                "current": self._serialize_song(self.current) if self.current else None,
+                "queue": [self._serialize_song(q) for q in list(self.queue)[:100]],
+            },
+        )
 
     def set_volume(self, pct: int) -> int:
         """Setzt die Lautstärke live (5%–200%) und speichert sie dauerhaft für diesen Server."""
@@ -241,11 +290,16 @@ class GuildMusicState:
             except Exception:
                 pass
 
-    async def cleanup(self, disconnect_voice: bool = True) -> None:
+    async def cleanup(
+        self,
+        disconnect_voice: bool = True,
+        clear_saved_session: bool = True,
+    ) -> None:
         """Trennt die Voice-Verbindung zuverlässig & komplett lautlos (ohne Chat-Nachricht)."""
+        if clear_saved_session:
+            clear_active_music_session(self.guild_id)
         self.queue.clear()
         self.current = None
-        self.loop_mode = "off"
         self.is_loading = False
         self._idle_seconds = 0
         self._empty_seconds = 0
@@ -704,6 +758,7 @@ async def play_next(state: GuildMusicState, text_channel: discord.abc.Messageabl
 
             if next_song is None:
                 state.current = None
+                clear_active_music_session(state.guild_id)
                 await state.clear_np_buttons_silently()
                 await state.restore_default_presence()
                 # Falls inzwischen auch niemand mehr im Kanal ist -> sofort lautlos leaven!
@@ -714,6 +769,7 @@ async def play_next(state: GuildMusicState, text_channel: discord.abc.Messageabl
 
             state.current = next_song
             state.reset_idle()
+            state.persist_session()
             if next_song.webpage_url:
                 state.history.append(next_song.webpage_url)
 
@@ -892,6 +948,7 @@ class MusicPlayerControlView(discord.ui.View):
             return
         order = ["off", "track", "queue"]
         self.state.loop_mode = order[(order.index(self.state.loop_mode) + 1) % len(order)]
+        set_guild_music_prefs(self.state.guild_id, loop_mode=self.state.loop_mode)
         self._sync_labels()
         await interaction.response.edit_message(embed=build_now_playing_embed(self.state), view=self)
 
@@ -905,6 +962,7 @@ class MusicPlayerControlView(discord.ui.View):
         qlist = list(self.state.queue)
         random.shuffle(qlist)
         self.state.queue = deque(qlist)
+        self.state.persist_session()
         await interaction.response.send_message(
             f"🔀 **{len(qlist)}** Songs wurden gemischt!", ephemeral=True, delete_after=5
         )
@@ -981,6 +1039,7 @@ class MusicPlayerControlView(discord.ui.View):
         if not await self._check_vc(interaction):
             return
         self.state.autoplay = not self.state.autoplay
+        set_guild_music_prefs(self.state.guild_id, autoplay=self.state.autoplay)
         self._sync_labels()
         await interaction.response.edit_message(embed=build_now_playing_embed(self.state), view=self)
 
@@ -1221,6 +1280,7 @@ class MusicCog(commands.Cog, name="Music"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._sessions_restored: bool = False
 
     async def cog_load(self) -> None:
         self.music_idle_checker.start()
@@ -1228,7 +1288,42 @@ class MusicCog(commands.Cog, name="Music"):
     async def cog_unload(self) -> None:
         self.music_idle_checker.cancel()
         for state in list(music_states.values()):
-            await state.cleanup()
+            state.persist_session()
+            await state.cleanup(clear_saved_session=False)
+
+    @commands.Cog.listener()
+    async def on_ready(self) -> None:
+        if self._sessions_restored:
+            return
+        self._sessions_restored = True
+        sessions = load_active_music_sessions()
+        if not sessions:
+            return
+        bot_id = self.bot.user.id if self.bot.user else 0
+        for gid, sess in sessions.items():
+            guild = self.bot.get_guild(gid)
+            if guild is None:
+                continue
+            vc_ch = guild.get_channel(int(sess.get("voice_channel_id") or 0))
+            if not isinstance(vc_ch, discord.VoiceChannel) or _count_humans_in_channel(guild, vc_ch, bot_id) == 0:
+                clear_active_music_session(gid)
+                continue
+            try:
+                state = get_music_state(gid, self.bot)
+                await ensure_voice_connected(state, vc_ch)
+                tc = guild.get_channel(int(sess.get("text_channel_id") or 0))
+                if tc is not None:
+                    state.text_channel = tc  # type: ignore[assignment]
+                if sess.get("current"):
+                    state.queue.append(GuildMusicState._deserialize_song(sess["current"]))
+                for q_item in sess.get("queue") or []:
+                    state.queue.append(GuildMusicState._deserialize_song(q_item))
+                if state.queue:
+                    print(f"🎵 [Music] Stelle unterbrochene Musik-Sitzung in Guild {gid} wieder her...")
+                    await play_next(state, state.text_channel)
+            except Exception as e:
+                print(f"⚠️ [Music] Konnte Musik-Sitzung in Guild {gid} nicht wiederherstellen: {e}")
+                clear_active_music_session(gid)
 
     def active_player_count(self) -> int:
         return sum(1 for vc in self.bot.voice_clients if vc.is_connected())
@@ -1628,6 +1723,7 @@ class MusicCog(commands.Cog, name="Music"):
         qlist = list(state.queue)
         random.shuffle(qlist)
         state.queue = deque(qlist)
+        state.persist_session()
         await interaction.response.send_message(f"🔀 **{len(qlist)}** Songs wurden gemischt!", delete_after=10)
 
     @app_commands.command(
@@ -1644,6 +1740,7 @@ class MusicCog(commands.Cog, name="Music"):
     async def cmd_autoplay(self, interaction: discord.Interaction, mode: str) -> None:
         state = get_music_state(interaction.guild_id, self.bot)
         state.autoplay = mode == "on"
+        set_guild_music_prefs(interaction.guild_id, autoplay=state.autoplay)
         if state.autoplay:
             await interaction.response.send_message(
                 "🔄 **Autoplay aktiviert!** Ähnliche Songs werden automatisch gespielt.", delete_after=10

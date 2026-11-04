@@ -55,6 +55,29 @@ class StatsTracker:
                 print(f"⚠️ Fehler beim Speichern von {STATS_FILE}: {e}")
 
     def flush(self) -> None:
+        with self._lock:
+            now = time.time()
+            for user_id, start in list(self._voice_sessions.items()):
+                duration = int(now - start)
+                if duration >= 5:
+                    uid = str(user_id)
+                    cursor = start
+                    while cursor < now:
+                        cursor_dt = datetime.datetime.fromtimestamp(cursor, DE_TZ)
+                        nxt = datetime.datetime.combine(
+                            cursor_dt.date() + datetime.timedelta(days=1),
+                            datetime.time.min,
+                            tzinfo=DE_TZ,
+                        ).timestamp()
+                        chunk_end = min(now, nxt)
+                        secs = int(chunk_end - cursor)
+                        if secs > 0:
+                            day = str(cursor_dt.date())
+                            self._data["voice_time"][uid] = int(self._data["voice_time"].get(uid, 0)) + secs
+                            vd = self._data["voice_days"].setdefault(uid, {})
+                            vd[day] = int(vd.get(day, 0)) + secs
+                        cursor = chunk_end
+                    self._voice_sessions[user_id] = now
         self.save(force=True)
 
     def add_message(self, user_id: int, username: str, channel_id: int | None = None) -> None:

@@ -7,7 +7,7 @@ import datetime
 import resource
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
 
 from bot_core.activity_helpers import (
     compute_activity_score,
@@ -45,6 +45,7 @@ from bot_core.config import (
 )
 from bot_core.stats import bot_runtime, stats_tracker
 from bot_core.storage import (
+    add_persistent_reminder,
     get_balance,
     get_fishing_data,
     get_job_data,
@@ -52,6 +53,7 @@ from bot_core.storage import (
     load_bank,
     load_data,
     open_tickets,
+    pop_due_reminders,
 )
 from bot_core.twitch_service import is_stream_currently_live_cached
 
@@ -155,7 +157,7 @@ def _build_help_embed(category: str) -> discord.Embed:
             value=(
                 "`/alerts` — Aktuellen Status aller Benachrichtigungen anzeigen\n"
                 "`/setlivealert [kanal] [ping_rolle] [ping_everyone]` — Automatischer „JETZT LIVE“-Post (inkl. Live-Update & Offline-Zusammenfassung)\n"
-                "`/setyoutubealert [kanal] [youtube_kanal] [ping_rolle] [ping_everyone]` — Automatische Posts bei neuen YouTube-Videos & Shorts\n"
+                "`/setyoutubealert [kanal] [youtube_kanal] [ping_rolle] [ping_everyone]` — Automatische Posts bei neuen YouTube-Uploads\n"
                 "`/testalert <typ>` — Sofort-Vorschau für Twitch, YouTube oder Inaktivität"
             ),
             inline=False,
@@ -372,6 +374,42 @@ class GeneralCog(commands.Cog, name="General"):
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
 
+    async def cog_load(self) -> None:
+        self.reminder_delivery_loop.start()
+
+    async def cog_unload(self) -> None:
+        if self.reminder_delivery_loop.is_running():
+            self.reminder_delivery_loop.cancel()
+
+    @tasks.loop(seconds=5)
+    async def reminder_delivery_loop(self) -> None:
+        due_list = pop_due_reminders()
+        for rem in due_list:
+            uid = int(rem.get("user_id") or 0)
+            cid = int(rem.get("channel_id") or 0)
+            msg_text = str(rem.get("message") or "")
+            delivered = False
+            if cid:
+                ch = self.bot.get_channel(cid)
+                if ch is not None and hasattr(ch, "send"):
+                    try:
+                        await ch.send(f"⏰ <@{uid}> **Dein Reminder:**\n{msg_text}")
+                        delivered = True
+                    except Exception:
+                        pass
+            if not delivered and uid:
+                try:
+                    user = self.bot.get_user(uid) or await self.bot.fetch_user(uid)
+                    if user is not None:
+                        dm = await user.create_dm()
+                        await dm.send(f"⏰ **Dein Reminder:**\n{msg_text}")
+                except Exception:
+                    pass
+
+    @reminder_delivery_loop.before_loop
+    async def _before_reminder_loop(self) -> None:
+        await self.bot.wait_until_ready()
+
     # ── Events: Message Tracking, Edit/Delete Logs & Member Join ──────────
 
     @commands.Cog.listener()
@@ -522,29 +560,18 @@ class GeneralCog(commands.Cog, name="General"):
 
         remind_at = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(seconds=seconds)
         remind_ts = int(remind_at.timestamp())
+        add_persistent_reminder(
+            user_id=interaction.user.id,
+            channel_id=interaction.channel_id or 0,
+            due_ts=remind_at.timestamp(),
+            message=nachricht,
+        )
         await interaction.response.send_message(
-            f"✅ **Reminder gesetzt!**\n📝 **Nachricht:** {nachricht}\n"
+            f"✅ **Reminder gesetzt!** *(bleibt auch nach Bot-Neustarts erhalten 💾)*\n"
+            f"📝 **Nachricht:** {nachricht}\n"
             f"⏰ **Erinnerung:** <t:{remind_ts}:R> (<t:{remind_ts}:T>)",
             ephemeral=True,
         )
-
-        async def _deliver() -> None:
-            await asyncio.sleep(seconds)
-            try:
-                if interaction.channel:
-                    await interaction.channel.send(
-                        f"⏰ {interaction.user.mention} **Dein Reminder:**\n{nachricht}"
-                    )
-                    return
-            except Exception:
-                pass
-            try:
-                dm = await interaction.user.create_dm()
-                await dm.send(f"⏰ **Dein Reminder:**\n{nachricht}")
-            except Exception:
-                pass
-
-        asyncio.create_task(_deliver())
 
     @app_commands.command(name="status", description="🤖 Zeigt den aktuellen System- & Modulstatus des Bots")
     @is_allowed_channel()

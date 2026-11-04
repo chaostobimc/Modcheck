@@ -51,14 +51,55 @@ from bot_core.storage import (
     get_balance,
     get_vault_data,
     load_bank,
+    refund_interrupted_escrows,
+    register_bet_escrow,
+    release_bet_escrow,
     save_bank,
     save_vault,
     set_balance,
     update_balance,
 )
 
-active_games: dict[int, str] = bot_runtime.active_games
-active_rr_games: dict[int, bool] = {}
+
+class _EscrowActiveGames(dict):
+    """Verknüpft laufende Spiele mit persistentem Einsatz-Escrow für 100% Schutz bei Bot-Neustarts."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._escrow_ids: dict[int, list[str]] = {}
+
+    def add_escrow(self, user_id: int, amount: int, game_name: str) -> None:
+        eid = register_bet_escrow(user_id, amount, game_name)
+        if eid:
+            self._escrow_ids.setdefault(user_id, []).append(eid)
+
+    def pop(self, key: Any, *args: Any) -> Any:
+        for eid in self._escrow_ids.pop(key, []):
+            release_bet_escrow(eid)
+        return super().pop(key, *args)
+
+
+class _EscrowRRGames(dict):
+    """Schützt Einsätze in Russisches-Roulette-Lobbys bei einem Bot-Neustart."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._escrows_by_ch: dict[int, list[str]] = {}
+
+    def add_player_escrow(self, channel_id: int, user_id: int, amount: int) -> None:
+        eid = register_bet_escrow(user_id, amount, "Russisches Roulette")
+        if eid:
+            self._escrows_by_ch.setdefault(channel_id, []).append(eid)
+
+    def pop(self, key: Any, *args: Any) -> Any:
+        for eid in self._escrows_by_ch.pop(key, []):
+            release_bet_escrow(eid)
+        return super().pop(key, *args)
+
+
+active_games: _EscrowActiveGames = _EscrowActiveGames()
+bot_runtime.active_games = active_games
+active_rr_games: _EscrowRRGames = _EscrowRRGames()
 
 
 def _record_net(user: discord.abc.User, net_delta: int) -> None:
@@ -964,6 +1005,7 @@ class RussianRouletteJoinView(discord.ui.View):
             return
 
         update_balance(interaction.user.id, -self.einsatz)
+        active_rr_games.add_player_escrow(self.channel_id, interaction.user.id, self.einsatz)
         self.players.append(interaction.user)
         plist = "\n".join(f"🔫 {p.mention}" for p in self.players)
         embed = discord.Embed(
@@ -1183,6 +1225,7 @@ class Connect4AcceptView(discord.ui.View):
         self.accepted = True
         update_balance(self.opponent.id, -self.einsatz)
         active_games[self.opponent.id] = "4 Gewinnt"
+        active_games.add_escrow(self.opponent.id, self.einsatz, "4 Gewinnt")
         game = Connect4Game(self.challenger.id, self.opponent.id)
         view = Connect4View(game, self.challenger, self.opponent, self.einsatz)
         embed = discord.Embed(
@@ -1334,6 +1377,7 @@ class TicTacToeAcceptView(discord.ui.View):
         self.accepted = True
         update_balance(self.opponent.id, -self.einsatz)
         active_games[self.opponent.id] = "Tic Tac Toe"
+        active_games.add_escrow(self.opponent.id, self.einsatz, "Tic Tac Toe")
         view = TicTacToeView(self.challenger, self.opponent, self.einsatz)
         embed = discord.Embed(
             title="❌⭕ Tic Tac Toe",
@@ -1371,6 +1415,15 @@ class GamblingCog(commands.Cog, name="Gambling"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        refunded = refund_interrupted_escrows()
+        if refunded:
+            total = sum(int(r.get("amount") or 0) for r in refunded)
+            print(
+                f"💰 [Casino] {len(refunded)} durch Neustart unterbrochene Spieleinsätze "
+                f"({total:,} Coins) automatisch zurückerstattet!"
+            )
 
     # ── Economy ───────────────────────────────────────────────────────────
 
@@ -1649,6 +1702,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return
         update_balance(interaction.user.id, -einsatz)
         active_games[interaction.user.id] = "Mines"
+        active_games.add_escrow(interaction.user.id, einsatz, "Mines")
         view = MinesView(interaction.user, einsatz, minen)
         embed = discord.Embed(
             title=f"💣 Mines ({minen} Minen)",
@@ -1666,6 +1720,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
         uid = interaction.user.id
         update_balance(uid, -einsatz)
         active_games[uid] = "Crash"
+        active_games.add_escrow(uid, einsatz, "Crash")
 
         try:
             r = random.random()
@@ -1762,6 +1817,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return
 
         active_games[uid] = "Blackjack"
+        active_games.add_escrow(uid, einsatz, "Blackjack")
         view = BlackjackView(interaction.user, einsatz, deck, p_hand, d_hand)
         await interaction.response.send_message(embed=view.build_embed(False), view=view)
 
@@ -1846,6 +1902,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return
         update_balance(interaction.user.id, -einsatz)
         active_games[interaction.user.id] = "Towers"
+        active_games.add_escrow(interaction.user.id, einsatz, "Towers")
         view = TowersView(interaction.user, einsatz, schwierigkeit)
         embed = discord.Embed(
             title="🏰 Towers",
@@ -1862,6 +1919,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return
         update_balance(interaction.user.id, -einsatz)
         active_games[interaction.user.id] = "High-Low"
+        active_games.add_escrow(interaction.user.id, einsatz, "High-Low")
         view = HighLowView(interaction.user, einsatz)
         embed = discord.Embed(
             title="🃏 High-Low",
@@ -2114,6 +2172,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return
         update_balance(interaction.user.id, -einsatz)
         active_games[interaction.user.id] = "Duell"
+        active_games.add_escrow(interaction.user.id, einsatz, "Duell")
         view = DuelAcceptView(interaction.user, gegner, einsatz)
         embed = discord.Embed(
             title="⚔️ Würfel-Duell Herausforderung!",
@@ -2140,6 +2199,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return
         update_balance(interaction.user.id, -einsatz)
         active_rr_games[interaction.channel_id] = True
+        active_rr_games.add_player_escrow(interaction.channel_id, interaction.user.id, einsatz)
         view = RussianRouletteJoinView(interaction.user, einsatz, interaction.channel_id)
         embed = discord.Embed(
             title="🔫 Russisches Roulette – Lobby geöffnet!",
@@ -2166,6 +2226,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return
         update_balance(interaction.user.id, -einsatz)
         active_games[interaction.user.id] = "4 Gewinnt"
+        active_games.add_escrow(interaction.user.id, einsatz, "4 Gewinnt")
         view = Connect4AcceptView(interaction.user, gegner, einsatz)
         embed = discord.Embed(
             title="🟡🔴 4 Gewinnt – Herausforderung!",
@@ -2190,6 +2251,7 @@ class GamblingCog(commands.Cog, name="Gambling"):
             return
         update_balance(interaction.user.id, -einsatz)
         active_games[interaction.user.id] = "Tic Tac Toe"
+        active_games.add_escrow(interaction.user.id, einsatz, "Tic Tac Toe")
         view = TicTacToeAcceptView(interaction.user, gegner, einsatz)
         embed = discord.Embed(
             title="❌⭕ Tic Tac Toe – Herausforderung!",
