@@ -146,11 +146,12 @@ YTDL_PLAYLIST_OPTIONS = {
 }
 
 YDL_PLAYER_CLIENT_FALLBACKS: list[dict[str, Any] | None] = [
-    {"extractor_args": {"youtube": {"player_client": ["tv"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["web"]}}},
     None,
+    {"extractor_args": {"youtube": {"player_client": ["visionos"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["tv_samsung"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["tv"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["web_embedded"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["android"]}}},
 ]
 
 
@@ -760,8 +761,24 @@ def _create_audio_source(
     return discord.FFmpegPCMAudio(stream_url, **fallback_opts)
 
 
-async def _wait_for_dave_ready(vc: discord.VoiceClient | None, timeout: float = 2.5) -> None:
-    """Wartet kurz ab, bis der Discord-DAVE-E2EE-Handshake (`dave_session.ready`) abgeschlossen ist."""
+def _ffmpeg_opts_for_info(info: dict[str, Any] | None) -> dict[str, str]:
+    """Baut FFMPEG_OPTIONS mit den exakt zum yt-dlp-Client passenden HTTP-Headern (z. B. visionOS / Tizen TV)."""
+    hdrs = (info or {}).get("http_headers")
+    if isinstance(hdrs, dict) and hdrs.get("User-Agent"):
+        ua = str(hdrs["User-Agent"]).replace('"', "'")
+        header_str = f"Referer: https://www.youtube.com/\r\nUser-Agent: {ua}\r\n"
+        return {
+            "before_options": (
+                "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+                f'-headers "{header_str}"'
+            ),
+            "options": "-vn",
+        }
+    return FFMPEG_OPTIONS
+
+
+async def _wait_for_dave_ready(vc: discord.VoiceClient | None, timeout: float = 3.0) -> None:
+    """Wartet kurz ab, bis der Discord-DAVE-E2EE-Handshake inkl. Schlüssel-Transition bereit ist."""
     if vc is None:
         return
     conn = getattr(vc, "_connection", None)
@@ -771,7 +788,13 @@ async def _wait_for_dave_ready(vc: discord.VoiceClient | None, timeout: float = 
     while asyncio.get_running_loop().time() < deadline:
         dave_ver = getattr(conn, "dave_protocol_version", 0)
         dave_sess = getattr(conn, "dave_session", None)
-        if dave_ver == 0 or (dave_sess is not None and getattr(dave_sess, "ready", False)):
+        if dave_ver == 0:
+            break
+        if (
+            dave_sess is not None
+            and getattr(dave_sess, "ready", False)
+            and getattr(dave_sess, "can_encrypt", True)
+        ):
             break
         await asyncio.sleep(0.05)
 
@@ -833,11 +856,13 @@ async def _play_song_robust(
             await _wait_for_dave_ready(state.voice_client)
             conn = getattr(state.voice_client, "_connection", None)
             dave_v = getattr(conn, "dave_protocol_version", "?") if conn else "?"
-            dave_r = getattr(getattr(conn, "dave_session", None), "ready", None) if conn else None
-            source = _create_audio_source(stream_url, FFMPEG_OPTIONS, state.volume_pct)
+            dave_sess = getattr(conn, "dave_session", None) if conn else None
+            dave_r = getattr(dave_sess, "ready", None) if dave_sess else None
+            dave_enc = getattr(dave_sess, "can_encrypt", None) if dave_sess else None
+            source = _create_audio_source(stream_url, _ffmpeg_opts_for_info(info), state.volume_pct)
             state.voice_client.play(source, after=_wrapped_after)
             print(
-                f"🎵 [Music] Starte Stream ({client_label}, dave_v={dave_v}, dave_ready={dave_r}, vol={state.volume_pct}%): "
+                f"🎵 [Music] Starte Stream ({client_label}, dave_v={dave_v}, ready={dave_r}, can_encrypt={dave_enc}, vol={state.volume_pct}%): "
                 f"{song.title}"
             )
         except Exception as e:
