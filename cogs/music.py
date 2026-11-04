@@ -3,11 +3,12 @@ from __future__ import annotations
 
 import asyncio
 from collections import deque
+import difflib
 import os
 import random
 import re
 from typing import Any
-from urllib.parse import quote
+from urllib.parse import parse_qs, quote, urlparse
 import aiohttp
 import discord
 from discord import app_commands
@@ -156,7 +157,16 @@ YDL_PLAYER_CLIENT_FALLBACKS: list[dict[str, Any] | None] = [
 
 
 class SongInfo:
-    __slots__ = ("title", "url", "webpage_url", "duration", "thumbnail", "requester", "is_radio")
+    __slots__ = (
+        "title",
+        "url",
+        "webpage_url",
+        "duration",
+        "thumbnail",
+        "requester",
+        "is_radio",
+        "artist",
+    )
 
     def __init__(
         self,
@@ -167,6 +177,7 @@ class SongInfo:
         thumbnail: str,
         requester: discord.abc.User | None,
         is_radio: bool = False,
+        artist: str = "",
     ) -> None:
         self.title = title
         self.url = url
@@ -175,6 +186,7 @@ class SongInfo:
         self.thumbnail = thumbnail or ""
         self.requester = requester
         self.is_radio = is_radio
+        self.artist = artist or ""
 
     @property
     def duration_str(self) -> str:
@@ -210,7 +222,10 @@ class GuildMusicState:
         self.loop_mode: str = str(mprefs.get("loop_mode", "off"))
         self.volume_pct: int = get_guild_volume(guild_id)
         self.dj_user_id: int = 0
-        self.history: deque[str] = deque(maxlen=15)
+        self.history: deque[str] = deque(maxlen=60)
+        self.played_tracks: deque[tuple[str, str, str]] = deque(maxlen=60)
+        self.autoplay_pool: deque[SongInfo] = deque(maxlen=25)
+        self.autoplay_seed_song: SongInfo | None = None
         self.is_loading: bool = False
         self._idle_seconds: int = 0
         self._empty_seconds: int = 0
@@ -237,6 +252,7 @@ class GuildMusicState:
             "duration": int(s.duration or 0),
             "thumbnail": s.thumbnail or "",
             "is_radio": bool(s.is_radio),
+            "artist": s.artist or "",
         }
 
     @staticmethod
@@ -251,6 +267,7 @@ class GuildMusicState:
             thumbnail=str(d.get("thumbnail") or ""),
             requester=None,
             is_radio=is_rad,
+            artist=str(d.get("artist") or ""),
         )
 
     def persist_session(self) -> None:
@@ -320,6 +337,9 @@ class GuildMusicState:
         self._empty_seconds = 0
         self._stale_current_seconds = 0
         self.history.clear()
+        self.played_tracks.clear()
+        self.autoplay_pool.clear()
+        self.autoplay_seed_song = None
         await self.clear_np_buttons_silently()
 
         guild = self.bot.get_guild(self.guild_id)
@@ -550,6 +570,214 @@ def _get_reference_url(entry: dict[str, Any], fallback_query: str = "") -> str:
     return fallback_query if _is_url(fallback_query) else ""
 
 
+def _extract_yt_video_id(url: str) -> str:
+    """Extrahiert die 11-stellige YouTube-Video-ID aus beliebigen YouTube-/YT-Music-URLs."""
+    if not url:
+        return ""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.netloc or "").lower()
+        if "youtu.be" in host:
+            vid = parsed.path.strip("/").split("/")[0]
+            return vid if len(vid) == 11 else ""
+        if "youtube.com" in host:
+            qs = parse_qs(parsed.query)
+            if "v" in qs and qs["v"]:
+                vid = qs["v"][0]
+                return vid if len(vid) == 11 else ""
+            parts = [p for p in parsed.path.split("/") if p]
+            if len(parts) >= 2 and parts[0] in ("shorts", "embed", "live", "v"):
+                return parts[1] if len(parts[1]) == 11 else ""
+    except Exception:
+        pass
+    m = re.search(r"(?:v=|youtu\.be/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else ""
+
+
+def _clean_artist_name(raw: str) -> str:
+    """Bereinigt Kanal-/Uploader-Namen wie 'Bonez MC - Topic' oder 'Rammstein Official' zum reinen Künstlernamen."""
+    if not raw:
+        return ""
+    s = str(raw).strip()
+    s = re.sub(r"\s*-\s*topic\b", "", s, flags=re.IGNORECASE)
+    s = re.sub(
+        r"\b(vevo|official\s*channel|official\s*music|official|offiziell|musik|music|records|recordings|tv)\b",
+        "",
+        s,
+        flags=re.IGNORECASE,
+    )
+    s = re.sub(r"\s+", " ", s).strip(" -–—|_•·")
+    return s
+
+
+def _entry_artist(entry: dict[str, Any] | None) -> str:
+    if not entry:
+        return ""
+    for key in ("artist", "creator", "uploader", "channel"):
+        val = entry.get(key)
+        if isinstance(val, str) and val.strip():
+            # Falls mehrere Künstler komma-separiert sind, den Hauptkünstler sauber behalten
+            cleaned = _clean_artist_name(val.split(",")[0])
+            if cleaned and cleaned.lower() not in ("various artists", "youtube", "unknown", "unbekannt"):
+                return cleaned
+    return ""
+
+
+def _norm_tokens(text: str) -> str:
+    s = text.lower()
+    s = (
+        s.replace("ä", "ae")
+        .replace("ö", "oe")
+        .replace("ü", "ue")
+        .replace("ß", "ss")
+    )
+    s = re.sub(r"[^a-z0-9\s]", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _split_artist_track(title: str, fallback_artist: str = "") -> tuple[str, str]:
+    """Zerlegt einen Videotitel in normalisierten `(artist_norm, track_norm)` ohne Reupload-/Video-Zusätze."""
+    if not title:
+        return _norm_tokens(fallback_artist), ""
+
+    s = str(title)
+    # 1) Klammern wie (Official Video), [Lyrics], (Prod. by ...), (HD), (Slowed), etc. entfernen
+    s = re.sub(r"\([^)]*\)|\[[^\]]*\]|\{[^}]*\}|【[^】]*】", " ", s)
+    # 2) Nachgestellte Metadaten nach Pipe / Doppelslash abschneiden (z. B. "Artist - Song | 16BARS")
+    s = re.split(r"\s(?:\||//|•)\s", s)[0]
+    # 3) feat./ft./prod. Anhängsel für den Kern-Titelvergleich entfernen
+    s = re.sub(r"\b(?:feat\.?|ft\.?|prod\.?\s*by|produced\s*by)\b.*$", " ", s, flags=re.IGNORECASE)
+    s = re.sub(
+        r"\b(?:official\s*(?:music\s*)?(?:video|audio|lyric\s*video|visualizer)|musikvideo|lyric\s*video|lyrics|audio|hd|4k|hq|remastered|radio\s*edit)\b",
+        " ",
+        s,
+        flags=re.IGNORECASE,
+    )
+
+    artist_part = ""
+    track_part = s
+    for sep in (" - ", " – ", " — ", " ― "):
+        if sep in s:
+            left, right = s.split(sep, 1)
+            if left.strip() and right.strip():
+                artist_part = left.strip()
+                track_part = right.strip()
+                break
+
+    if not artist_part and fallback_artist:
+        artist_part = _clean_artist_name(fallback_artist)
+
+    # Primären Künstler vor 'x', '&', ',', 'feat' isolieren für stabilen Vergleich
+    primary_artist = re.split(r"\s(?:&|x|X|und|and|,|feat\.?|ft\.?)\s", artist_part)[0].strip()
+    artist_norm = _norm_tokens(primary_artist or artist_part)
+    track_norm = _norm_tokens(track_part)
+
+    # Falls im Titel ohne Bindestrich der Künstlername am Anfang stand (z. B. "Apache 207 Roller") -> abziehen
+    if artist_norm and track_norm.startswith(artist_norm + " "):
+        stripped = track_norm[len(artist_norm) :].strip()
+        if len(stripped) >= 2:
+            track_norm = stripped
+
+    return artist_norm, track_norm
+
+
+def _build_song_record(song: SongInfo) -> tuple[str, str, str]:
+    vid = _extract_yt_video_id(song.webpage_url) or (song.webpage_url or "").strip()
+    a_norm, t_norm = _split_artist_track(song.title, song.artist)
+    return (vid, a_norm, t_norm)
+
+
+def _is_same_or_reupload(
+    cand_title: str,
+    cand_artist: str,
+    cand_url: str,
+    seen_records: list[tuple[str, str, str]],
+) -> bool:
+    """Erkennt zuverlässig denselben Song sowie Reuploads, Lyrics-Videos, Live-/Remix-/Topic-Kopien."""
+    cand_vid = _extract_yt_video_id(cand_url) or cand_url.strip()
+    cand_a, cand_t = _split_artist_track(cand_title, cand_artist)
+    if not cand_t:
+        return True
+
+    cand_tokens = set(cand_t.split())
+
+    for seen_vid, seen_a, seen_t in seen_records:
+        if cand_vid and seen_vid and cand_vid == seen_vid:
+            return True
+        if not seen_t:
+            continue
+
+        seen_full = f"{seen_a} {seen_t}".strip() if seen_a else seen_t
+        cand_full = f"{cand_a} {cand_t}".strip() if cand_a else cand_t
+
+        # 1) Exakter Kern-Titel-Treffer oder voller "Künstler + Titel"-Treffer (auch ohne Bindestrich bei Reuploads!)
+        if cand_t == seen_t or cand_t == seen_full or cand_full == seen_full:
+            same_artist = bool(cand_a and seen_a and (cand_a in seen_a or seen_a in cand_a))
+            if same_artist or cand_t == seen_full or cand_full == seen_full or len(cand_tokens) >= 2 or len(cand_t) >= 6:
+                return True
+
+        # 2) Teilstring-Treffer bei gleichem Künstler (z. B. "Roller" vs "Roller Live" / "Roller Pt 2")
+        same_artist = bool(cand_a and seen_a and (cand_a in seen_a or seen_a in cand_a))
+        if same_artist and len(cand_t) >= 4 and len(seen_t) >= 4:
+            if cand_t in seen_t or seen_t in cand_t:
+                return True
+
+        # 3) Hohe Fuzzy-Ähnlichkeit des Songtitels (Reuploads mit leicht anderer Schreibweise)
+        ratio = difflib.SequenceMatcher(None, cand_t, seen_t).ratio()
+        if ratio >= 0.84 or (same_artist and ratio >= 0.74):
+            return True
+
+        # 4) Token-Überlappung (z. B. gleiche Wörter in anderer Reihenfolge oder mit Zusatzwort)
+        seen_tokens = set(seen_t.split())
+        min_len = min(len(cand_tokens), len(seen_tokens))
+        if min_len >= 2:
+            overlap = len(cand_tokens & seen_tokens) / min_len
+            if overlap >= 0.85 or (same_artist and overlap >= 0.75):
+                return True
+
+    return False
+
+
+_AUTOPLAY_JUNK_PATTERNS = re.compile(
+    r"\b("
+    r"slowed|reverb|sped\s*up|nightcore|8d\s*audio|bass\s*boosted|karaoke|instrumental|acapella|"
+    r"backing\s*track|tutorial|piano\s*cover|guitar\s*cover|drum\s*cover|ai\s*cover|"
+    r"reaction|reagiert|reacts\s*to|interview|podcast|gameplay|let'?s\s*play|walkthrough|"
+    r"trailer|teaser|making\s*of|behind\s*the\s*scenes|vlog|prank|challenge|"
+    r"compilation|best\s*of|full\s*album|ganzes\s*album|1\s*hour|1\s*stunde|10\s*hours|"
+    r"stream\s*highlights|#shorts|shorts|tiktok\s*compilation"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def _is_junk_autoplay_entry(
+    entry: dict[str, Any],
+    title: str,
+    duration: int,
+    seed_song: SongInfo,
+) -> bool:
+    """Filtert Nicht-Musik, Shorts, stundenlange Compilations, Livestreams und verfremdete Reuploads heraus."""
+    if not title or title.lower() in ("unbekannt", "[deleted video]", "[private video]"):
+        return True
+    if entry.get("is_live") or entry.get("live_status") in ("is_live", "is_upcoming"):
+        return True
+
+    # Dauer-Check: Keine Shorts/Soundeffekte (< 70s) und keine langen Mixes/Podcasts (> 10 Min)
+    max_dur = max(600, int(seed_song.duration * 1.8)) if seed_song.duration > 480 else 600
+    if duration > 0 and (duration < 70 or duration > max_dur):
+        return True
+
+    # Verfremdete Versionen / Nicht-Musik ablehnen (außer der Nutzer hat selbst genau so etwas gestartet)
+    m = _AUTOPLAY_JUNK_PATTERNS.search(title)
+    if m:
+        matched_word = m.group(1).lower()
+        if matched_word not in seed_song.title.lower():
+            return True
+
+    return False
+
+
 async def ytdl_extract(query: str, options: dict[str, Any]) -> dict[str, Any] | None:
     if not YTDLP_AVAILABLE or not runtime_settings.get("music_enabled", MUSIC_ENABLED):
         return None
@@ -617,22 +845,200 @@ def _resolve_with_client(webpage_url: str, extra_opts: dict[str, Any] | None = N
     return None, info
 
 
+YTDL_MIX_OPTIONS = {
+    "format": "bestaudio/best",
+    "noplaylist": False,
+    "nocheckcertificate": True,
+    "ignoreerrors": True,
+    "quiet": True,
+    "no_warnings": True,
+    "source_address": "0.0.0.0",
+    "extract_flat": True,
+    "playlistend": 25,
+    "cachedir": False,
+    **YDL_TIMEOUTS,
+}
+
+
+async def _extract_youtube_mix(video_id: str) -> tuple[list[dict[str, Any]], str]:
+    """Lädt YouTubes echten algorithmischen Song-Mix (zuerst YouTube Music RDAMVM, sonst YouTube RD)."""
+    if not video_id:
+        return [], ""
+    mix_urls = [
+        (f"https://music.youtube.com/watch?v={video_id}&list=RDAMVM{video_id}", "ytm_mix"),
+        (f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}", "yt_mix"),
+    ]
+    for url, source_tag in mix_urls:
+        info = await ytdl_extract(url, YTDL_MIX_OPTIONS)
+        entries = [e for e in ((info or {}).get("entries") or []) if isinstance(e, dict)]
+        if len(entries) >= 2:
+            return entries, source_tag
+    return [], ""
+
+
+def _collect_seen_records(state: GuildMusicState, base_song: SongInfo) -> list[tuple[str, str, str]]:
+    seen: list[tuple[str, str, str]] = list(state.played_tracks)
+    seen.append(_build_song_record(base_song))
+    if state.autoplay_seed_song is not None:
+        seen.append(_build_song_record(state.autoplay_seed_song))
+    for q_song in state.queue:
+        seen.append(_build_song_record(q_song))
+    for h_url in state.history:
+        vid = _extract_yt_video_id(h_url) or h_url
+        seen.append((vid, "", ""))
+    return seen
+
+
+def _score_autoplay_entry(
+    entry: dict[str, Any],
+    cand_artist: str,
+    duration: int,
+    last_artist_norm: str,
+    seed_artist_norm: str,
+    source_tag: str,
+    rank_idx: int,
+) -> float:
+    score = 100.0 - (rank_idx * 1.8)
+    if source_tag == "ytm_mix":
+        score += 25.0
+    elif source_tag == "yt_mix":
+        score += 18.0
+
+    raw_uploader = str(entry.get("uploader") or entry.get("channel") or "")
+    if "- topic" in raw_uploader.lower():
+        score += 14.0
+    elif "vevo" in raw_uploader.lower() or "official" in raw_uploader.lower():
+        score += 9.0
+
+    # Typische Studio-Song-Länge (2:00 – 5:30) leicht bevorzugen
+    if 115 <= duration <= 330:
+        score += 8.0
+    elif duration == 0:
+        score -= 6.0
+
+    cand_a_norm = _norm_tokens(cand_artist)
+    # Abwechslung: Nicht direkt denselben Künstler zweimal direkt hintereinander erzwingen, wenn Alternativen da sind
+    if cand_a_norm and last_artist_norm and cand_a_norm == last_artist_norm:
+        score -= 11.0
+    elif cand_a_norm and seed_artist_norm and cand_a_norm == seed_artist_norm:
+        score += 6.0
+
+    return score
+
+
 async def _find_autoplay_song(state: GuildMusicState, base_song: SongInfo) -> SongInfo | None:
-    clean_title = re.sub(r"\(.*?\)|\[.*?\]", "", base_song.title).strip()
-    results = await search_tracks(f"{clean_title} official audio", limit=8)
-    for entry in results:
-        ref = _get_reference_url(entry)
-        if not ref or ref in state.history or ref == base_song.webpage_url:
-            continue
-        return SongInfo(
-            title=entry.get("title", "Autoplay Track"),
-            url="",
-            webpage_url=ref,
-            duration=int(entry.get("duration") or 0),
-            thumbnail=_entry_thumbnail(entry),
-            requester=None,
-        )
-    return None
+    """Intelligentes Autoplay v2.0:
+    1) Nutzt YouTube Music / YouTube Radio-Mix (`RDAMVM` / `RD`) für genre- & stimmungstreue Empfehlungen.
+    2) Verankert am letzten aktiv vom User gewünschten Song (`autoplay_seed_song`) gegen Genre-Drift.
+    3) Blockiert Reuploads, Lyrics-Kopien, Remixe desselben Titels sowie Shorts, Compilations & Nicht-Musik.
+    """
+    seed_song = state.autoplay_seed_song or base_song
+    seen_records = _collect_seen_records(state, base_song)
+
+    # 1) Bereits kuratierte Empfehlungen aus dem aktuellen Mix-Pool prüfen
+    while state.autoplay_pool:
+        pooled = state.autoplay_pool.popleft()
+        if not _is_same_or_reupload(pooled.title, pooled.artist, pooled.webpage_url, seen_records):
+            print(f"🔄 [Autoplay] Aus Mix-Pool gewählt: {pooled.title}")
+            return pooled
+
+    last_artist_norm, _ = _split_artist_track(base_song.title, base_song.artist)
+    seed_artist_norm, _ = _split_artist_track(seed_song.title, seed_song.artist)
+
+    raw_batches: list[tuple[list[dict[str, Any]], str]] = []
+
+    # 2) Primärquelle: Algorithmischer YouTube Music / YouTube Radio-Mix zum Seed-Song (und ggf. aktuellem Song)
+    checked_vids: set[str] = set()
+    for ref_song in (base_song, seed_song):
+        vid = _extract_yt_video_id(ref_song.webpage_url)
+        if vid and vid not in checked_vids:
+            checked_vids.add(vid)
+            mix_entries, mix_tag = await _extract_youtube_mix(vid)
+            if mix_entries:
+                raw_batches.append((mix_entries, mix_tag))
+                break
+
+    # 3) Fallback (falls kein Mix verfügbar): Gezielte Künstler-Katalogsuche OHNE den aktuellen Songtitel!
+    if not raw_batches:
+        artist_name = _clean_artist_name(seed_song.artist or base_song.artist)
+        if not artist_name:
+            for s_try in (seed_song, base_song):
+                if " - " in s_try.title:
+                    artist_name = _clean_artist_name(s_try.title.split(" - ", 1)[0])
+                    if artist_name:
+                        break
+
+        if artist_name:
+            topic_res = await search_tracks(f"{artist_name} - Topic", limit=12)
+            if topic_res:
+                raw_batches.append((topic_res, "artist_topic"))
+            audio_res = await search_tracks(f"{artist_name} official audio", limit=12)
+            if audio_res:
+                raw_batches.append((audio_res, "artist_catalog"))
+        else:
+            clean_title = re.sub(r"\(.*?\)|\[.*?\]", "", seed_song.title).strip()
+            fallback_res = await search_tracks(f"{clean_title} music mix", limit=15)
+            if fallback_res:
+                raw_batches.append((fallback_res, "search_fallback"))
+
+    scored_candidates: list[tuple[float, SongInfo]] = []
+    batch_records = list(seen_records)
+
+    for entries, source_tag in raw_batches:
+        for idx, entry in enumerate(entries):
+            ref = _get_reference_url(entry)
+            if not ref:
+                continue
+            # Immer auf saubere Standard-Watch-URL normalisieren für zuverlässige Extraktion
+            vid = _extract_yt_video_id(ref)
+            if vid:
+                ref = f"https://www.youtube.com/watch?v={vid}"
+
+            title = str(entry.get("title") or "").strip()
+            dur = int(entry.get("duration") or 0)
+            cand_artist = _entry_artist(entry)
+
+            if _is_junk_autoplay_entry(entry, title, dur, seed_song):
+                continue
+            if _is_same_or_reupload(title, cand_artist, ref, batch_records):
+                continue
+
+            # Falls YouTube Music im Titel nur den Tracknamen ohne Künstler liefert, für klare Anzeige ergänzen
+            display_title = title
+            if cand_artist and " - " not in title and cand_artist.lower() not in title.lower():
+                display_title = f"{cand_artist} - {title}"
+
+            cand_song = SongInfo(
+                title=display_title,
+                url="",
+                webpage_url=ref,
+                duration=dur,
+                thumbnail=_entry_thumbnail(entry),
+                requester=None,
+                artist=cand_artist,
+            )
+            batch_records.append(_build_song_record(cand_song))
+            sc = _score_autoplay_entry(
+                entry, cand_artist, dur, last_artist_norm, seed_artist_norm, source_tag, idx
+            )
+            scored_candidates.append((sc, cand_song))
+
+    if not scored_candidates:
+        return None
+
+    scored_candidates.sort(key=lambda item: item[0], reverse=True)
+
+    # Leichte Variation unter den Top-3-Treffern für natürliches Radio-Feeling, Rest in den Pool legen
+    top_slice = scored_candidates[: min(3, len(scored_candidates))]
+    chosen_pair = random.choice(top_slice)
+    chosen_song = chosen_pair[1]
+
+    for _, s_cand in scored_candidates[:14]:
+        if s_cand is not chosen_song:
+            state.autoplay_pool.append(s_cand)
+
+    print(f"🔄 [Autoplay] Nächster Song gewählt: {chosen_song.title} (Pool: {len(state.autoplay_pool)})")
+    return chosen_song
 
 
 # ── Spotify Helpers ────────────────────────────────────────────────────────
@@ -840,6 +1246,8 @@ async def _play_song_robust(
                 song.duration = int(info["duration"])
             if not song.thumbnail:
                 song.thumbnail = _entry_thumbnail(info)
+            if not song.artist:
+                song.artist = _entry_artist(info)
 
         early_error: list[Exception] = []
         done_flag = asyncio.Event()
@@ -946,6 +1354,14 @@ async def play_next(state: GuildMusicState, text_channel: discord.abc.Messageabl
             state.persist_session()
             if next_song.webpage_url:
                 state.history.append(next_song.webpage_url)
+            if not next_song.is_radio:
+                # Wenn ein Nutzer aktiv einen Song gewünscht hat, Autoplay-Anker & Pool auf diesen Song ausrichten
+                if next_song.requester is not None:
+                    prev_seed_url = state.autoplay_seed_song.webpage_url if state.autoplay_seed_song else ""
+                    state.autoplay_seed_song = next_song
+                    if next_song.webpage_url != prev_seed_url:
+                        state.autoplay_pool.clear()
+                state.played_tracks.append(_build_song_record(next_song))
 
             bot_loop = state.bot.loop
 
@@ -955,6 +1371,11 @@ async def play_next(state: GuildMusicState, text_channel: discord.abc.Messageabl
                 asyncio.run_coroutine_threadsafe(play_next(state), bot_loop)
 
             ok = await _play_song_robust(state, next_song, _after_playback)
+            # Nach erfolgreichem Resolve ggf. angereicherten Artist ebenfalls in played_tracks aktualisieren
+            if ok and not next_song.is_radio and next_song.artist:
+                rec = _build_song_record(next_song)
+                if not state.played_tracks or state.played_tracks[-1] != rec:
+                    state.played_tracks.append(rec)
         finally:
             state.is_loading = False
         if not ok:
@@ -1320,6 +1741,7 @@ class SearchResultSelectView(discord.ui.View):
             duration=int(entry.get("duration") or 0),
             thumbnail=_entry_thumbnail(entry),
             requester=interaction.user,
+            artist=_entry_artist(entry),
         )
         state.queue.append(song)
         await interaction.edit_original_response(
@@ -1716,6 +2138,7 @@ class MusicCog(commands.Cog, name="Music"):
                         duration=sp.get("duration") or int(entry.get("duration") or 0),
                         thumbnail=sp.get("thumbnail") or _entry_thumbnail(entry),
                         requester=interaction.user,
+                        artist=_entry_artist(entry),
                     )
                     state.queue.append(song)
                     if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
@@ -1823,6 +2246,7 @@ class MusicCog(commands.Cog, name="Music"):
                 duration=int(entry.get("duration") or 0),
                 thumbnail=_entry_thumbnail(entry),
                 requester=interaction.user,
+                artist=_entry_artist(entry),
             )
             state.queue.append(song)
 
