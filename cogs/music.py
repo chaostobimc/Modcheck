@@ -760,6 +760,22 @@ def _create_audio_source(
     return discord.FFmpegPCMAudio(stream_url, **fallback_opts)
 
 
+async def _wait_for_dave_ready(vc: discord.VoiceClient | None, timeout: float = 2.5) -> None:
+    """Wartet kurz ab, bis der Discord-DAVE-E2EE-Handshake (`dave_session.ready`) abgeschlossen ist."""
+    if vc is None:
+        return
+    conn = getattr(vc, "_connection", None)
+    if conn is None:
+        return
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        dave_ver = getattr(conn, "dave_protocol_version", 0)
+        dave_sess = getattr(conn, "dave_session", None)
+        if dave_ver == 0 or (dave_sess is not None and getattr(dave_sess, "ready", False)):
+            break
+        await asyncio.sleep(0.05)
+
+
 async def _play_song_robust(
     state: GuildMusicState, song: SongInfo, after_cb
 ) -> bool:
@@ -768,6 +784,7 @@ async def _play_song_robust(
 
     if song.is_radio and song.url:
         try:
+            await _wait_for_dave_ready(state.voice_client)
             source = _create_audio_source(song.url, RADIO_FFMPEG_OPTIONS, state.volume_pct)
             state.voice_client.play(source, after=after_cb)
             await asyncio.sleep(1.5)
@@ -780,11 +797,17 @@ async def _play_song_robust(
     for extra_opts in YDL_PLAYER_CLIENT_FALLBACKS:
         if not state.voice_client or not state.voice_client.is_connected():
             return False
+        client_label = (
+            ",".join(extra_opts.get("extractor_args", {}).get("youtube", {}).get("player_client", []))
+            if extra_opts
+            else "default"
+        )
         try:
             stream_url, info = await loop.run_in_executor(
                 None, _resolve_with_client, song.webpage_url, extra_opts
             )
-        except Exception:
+        except Exception as e:
+            print(f"⚠️ [Music] Client '{client_label}' Extraktionsfehler: {e}")
             continue
         if not stream_url:
             continue
@@ -807,15 +830,28 @@ async def _play_song_robust(
             after_cb(err)
 
         try:
+            await _wait_for_dave_ready(state.voice_client)
+            conn = getattr(state.voice_client, "_connection", None)
+            dave_v = getattr(conn, "dave_protocol_version", "?") if conn else "?"
+            dave_r = getattr(getattr(conn, "dave_session", None), "ready", None) if conn else None
             source = _create_audio_source(stream_url, FFMPEG_OPTIONS, state.volume_pct)
             state.voice_client.play(source, after=_wrapped_after)
-        except Exception:
+            print(
+                f"🎵 [Music] Starte Stream ({client_label}, dave_v={dave_v}, dave_ready={dave_r}, vol={state.volume_pct}%): "
+                f"{song.title}"
+            )
+        except Exception as e:
+            print(f"⚠️ [Music] Konnte FFmpeg für Client '{client_label}' nicht starten: {e}")
             continue
 
         try:
             await asyncio.wait_for(done_flag.wait(), timeout=2.2)
             # Innerhalb von 2.2s beendet -> meist 403 Forbidden -> nächsten Client testen!
             if song.duration == 0 or song.duration > 4 or early_error:
+                print(
+                    f"⚠️ [Music] Stream über '{client_label}' brach früh ab "
+                    f"(err={early_error[0] if early_error else 'EOF'}) – teste Fallback..."
+                )
                 continue
             # Sehr kurzer Soundeffekt (<= 4s) regulär beendet -> Callback nachreichen!
             song.url = stream_url

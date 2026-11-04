@@ -6,21 +6,62 @@ Startpunkt für lokales Ausführen sowie für den Raspberry Pi 5 systemd-Dienst:
 from __future__ import annotations
 
 import asyncio
+import importlib.metadata
 import importlib.util
 import shutil
+import subprocess
 import sys
 import traceback
+
+
+def _parse_ver(v: str) -> tuple[int, ...]:
+    parts: list[int] = []
+    for seg in v.split(".")[:3]:
+        digits = "".join(ch for ch in seg if ch.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+def _ensure_compatible_voice_deps() -> None:
+    """Stellt vor `import discord` sicher, dass discord.py 2.7.x mit davey 0.1.7 läuft (DAVE E2EE Pflicht)."""
+    try:
+        dpy_s = importlib.metadata.version("discord.py")
+    except Exception:
+        dpy_s = "0.0.0"
+    try:
+        davey_s: str | None = importlib.metadata.version("davey")
+    except Exception:
+        davey_s = None
+
+    dpy_v = _parse_ver(dpy_s)
+    davey_v = _parse_ver(davey_s) if davey_s else (0, 0, 0)
+    if dpy_v < (2, 7, 1) or davey_s is None or davey_v < (0, 1, 7) or (dpy_v < (2, 8, 0) and davey_v >= (0, 2, 0)):
+        print(
+            f"🔧 [Voice-AutoFix] Repariere DAVE-Abhängigkeiten (discord.py={dpy_s}, davey={davey_s}) "
+            "-> discord.py[voice]>=2.7.1,<2.8.0 + davey>=0.1.7,<0.2.0 ..."
+        )
+        try:
+            subprocess.check_call(
+                [
+                    sys.executable,
+                    "-m",
+                    "pip",
+                    "install",
+                    "--quiet",
+                    "discord.py[voice]>=2.7.1,<2.8.0",
+                    "davey>=0.1.7,<0.2.0",
+                ]
+            )
+            print("  ✅ [Voice-AutoFix] davey 0.1.7 erfolgreich installiert.")
+        except Exception as exc:
+            print(f"  ⚠️ [Voice-AutoFix] Konnte Pakete nicht automatisch anpassen: {exc}")
+
+
+_ensure_compatible_voice_deps()
 
 import discord
 from discord import app_commands
 from discord.ext import commands
-
-# Umgeht den discord.py 2.7.x DAVE-Bug (#10549: grüner Redekreis ohne Ton) und nutzt den bewährten Transport-Modus
-try:
-    import discord.voice_state as _dvs
-    _dvs.has_dave = False
-except Exception:
-    pass
 
 from bot_core.config import (
     ADMIN_USER_IDS,
@@ -56,6 +97,13 @@ def check_system_requirements() -> bool:
         print("  🔐 PyNaCl:  ✅ Voice-Verschlüsselung bereit")
     else:
         print("  🔐 PyNaCl:  ❌ fehlt – pip install PyNaCl")
+
+    try:
+        davey_ver = importlib.metadata.version("davey")
+        has_dave = getattr(getattr(discord, "voice_state", None), "has_dave", None)
+        print(f"  🛡️ DAVE:    ✅ discord.py {discord.__version__} + davey {davey_ver} (has_dave={has_dave})")
+    except Exception:
+        print(f"  🛡️ DAVE:    ❌ davey fehlt (discord.py {discord.__version__})")
 
     try:
         import yt_dlp
