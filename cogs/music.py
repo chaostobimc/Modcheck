@@ -6,6 +6,8 @@ from collections import deque
 import os
 import random
 import re
+import threading
+import time
 from typing import Any
 from urllib.parse import quote
 import aiohttp
@@ -82,20 +84,36 @@ _YT_HEADERS = (
 
 FFMPEG_OPTIONS = {
     "before_options": (
-        "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 "
+        "-nostdin -thread_queue_size 4096 "
+        "-probesize 64k -analyzeduration 0 "
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
+        "-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5 "
         f'-headers "{_YT_HEADERS}"'
     ),
-    "options": "-vn",
+    "options": "-vn -sn -dn -bufsize 8M",
 }
 
 RADIO_FFMPEG_OPTIONS = {
-    "before_options": "-nostdin -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5",
-    "options": "-vn",
+    "before_options": (
+        "-nostdin -thread_queue_size 4096 "
+        "-probesize 64k -analyzeduration 0 "
+        "-reconnect 1 -reconnect_streamed 1 -reconnect_on_network_error 1 "
+        "-reconnect_on_http_error 4xx,5xx -reconnect_delay_max 5"
+    ),
+    "options": "-vn -sn -dn -bufsize 8M",
 }
 
+BEST_AUDIO_FORMAT = (
+    "bestaudio[acodec=opus]/bestaudio[ext=webm]/bestaudio[ext=m4a]/"
+    "bestaudio[protocol^=http][protocol!=m3u8][protocol!=m3u8_native]/bestaudio/best"
+)
+
+STREAM_URL_MAX_AGE_SECS = 2700  # 45 Minuten Cache-Gültigkeit für vorab aufgelöste Stream-URLs
+_ydl_thread_local = threading.local()
+
 YDL_TIMEOUTS = {
-    "socket_timeout": 20,
-    "request_timeout": 20,
+    "socket_timeout": 15,
+    "request_timeout": 15,
     "extractor_retries": 2,
 }
 
@@ -117,8 +135,21 @@ def _cookie_and_pot_opts() -> dict[str, Any]:
     return opts
 
 
+def _get_thread_ydl(cache_key: str, opts: dict[str, Any]) -> Any:
+    """Wiederverwendet initialisierte YoutubeDL-Instanzen pro Worker-Thread (massiver Speed-Boost auf dem Pi)."""
+    pool: dict[str, Any] | None = getattr(_ydl_thread_local, "pool", None)
+    if pool is None:
+        pool = {}
+        _ydl_thread_local.pool = pool
+    ydl = pool.get(cache_key)
+    if ydl is None:
+        ydl = yt_dlp.YoutubeDL(opts)
+        pool[cache_key] = ydl
+    return ydl
+
+
 YTDL_SEARCH_OPTIONS = {
-    "format": "bestaudio/best",
+    "format": BEST_AUDIO_FORMAT,
     "noplaylist": True,
     "nocheckcertificate": True,
     "ignoreerrors": True,
@@ -132,7 +163,7 @@ YTDL_SEARCH_OPTIONS = {
 }
 
 YTDL_PLAYLIST_OPTIONS = {
-    "format": "bestaudio/best",
+    "format": BEST_AUDIO_FORMAT,
     "noplaylist": False,
     "nocheckcertificate": True,
     "ignoreerrors": True,
@@ -146,16 +177,24 @@ YTDL_PLAYLIST_OPTIONS = {
 }
 
 YDL_PLAYER_CLIENT_FALLBACKS: list[dict[str, Any] | None] = [
-    {"extractor_args": {"youtube": {"player_client": ["tv"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["android"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
-    {"extractor_args": {"youtube": {"player_client": ["web"]}}},
     None,
+    {"extractor_args": {"youtube": {"player_client": ["ios"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["android"]}}},
+    {"extractor_args": {"youtube": {"player_client": ["web"]}}},
 ]
 
 
 class SongInfo:
-    __slots__ = ("title", "url", "webpage_url", "duration", "thumbnail", "requester", "is_radio")
+    __slots__ = (
+        "title",
+        "url",
+        "webpage_url",
+        "duration",
+        "thumbnail",
+        "requester",
+        "is_radio",
+        "resolved_at",
+    )
 
     def __init__(
         self,
@@ -166,6 +205,7 @@ class SongInfo:
         thumbnail: str,
         requester: discord.abc.User | None,
         is_radio: bool = False,
+        resolved_at: float = 0.0,
     ) -> None:
         self.title = title
         self.url = url
@@ -174,6 +214,16 @@ class SongInfo:
         self.thumbnail = thumbnail or ""
         self.requester = requester
         self.is_radio = is_radio
+        self.resolved_at = resolved_at or (time.monotonic() if (url and not is_radio) else 0.0)
+
+    def has_fresh_stream_url(self) -> bool:
+        if self.is_radio:
+            return bool(self.url)
+        return bool(
+            self.url
+            and self.resolved_at > 0
+            and (time.monotonic() - self.resolved_at) < STREAM_URL_MAX_AGE_SECS
+        )
 
     @property
     def duration_str(self) -> str:
@@ -208,6 +258,11 @@ class GuildMusicState:
         self.autoplay: bool = bool(mprefs.get("autoplay", False))
         self.loop_mode: str = str(mprefs.get("loop_mode", "off"))
         self.volume_pct: int = get_guild_volume(guild_id)
+        self.dj_user_id: int = 0
+        self.last_voice_channel_id: int = 0
+        self._intentional_disconnect: bool = False
+        self._last_auto_reconnect_ts: float = 0.0
+        self._prefetch_task: asyncio.Task[Any] | None = None
         self.history: deque[str] = deque(maxlen=15)
         self.is_loading: bool = False
         self._idle_seconds: int = 0
@@ -215,6 +270,16 @@ class GuildMusicState:
         self._stale_current_seconds: int = 0
         self._lock = asyncio.Lock()
         self.consecutive_failures: int = 0
+
+    def active_channel(self) -> discord.VoiceChannel | discord.StageChannel | None:
+        """Gibt den aktuell verbundenen Voice-Kanal des Bots zurück (oder None)."""
+        guild = self.bot.get_guild(self.guild_id)
+        vc = (guild.voice_client if guild else None) or self.voice_client
+        if vc is not None and vc.is_connected() and vc.channel is not None:
+            return vc.channel
+        if guild is not None and guild.me is not None and guild.me.voice and guild.me.voice.channel:
+            return guild.me.voice.channel
+        return None
 
     @staticmethod
     def _serialize_song(s: SongInfo) -> dict[str, Any]:
@@ -237,14 +302,19 @@ class GuildMusicState:
             webpage_url=wurl,
             duration=int(d.get("duration") or 0),
             thumbnail=str(d.get("thumbnail") or ""),
+            requester=None,
             is_radio=is_rad,
         )
 
     def persist_session(self) -> None:
-        """Sichert den aktuellen Song/Radiosender & die Queue für nahtlosen Auto-Resume nach Neustarts."""
-        guild = self.bot.get_guild(self.guild_id)
-        vc = self.voice_client or (guild.voice_client if guild else None)
-        vc_ch = vc.channel if (vc and vc.is_connected() and vc.channel) else None
+        """Sichert den aktuellen Song/Radiosender, DJ & die Queue für nahtlosen Auto-Resume nach Neustarts."""
+        vc_ch = self.active_channel()
+        if vc_ch is None and self.last_voice_channel_id:
+            guild = self.bot.get_guild(self.guild_id)
+            if guild is not None:
+                cand = guild.get_channel(self.last_voice_channel_id)
+                if isinstance(cand, (discord.VoiceChannel, discord.StageChannel)):
+                    vc_ch = cand
         if vc_ch is None or (self.current is None and not self.queue):
             clear_active_music_session(self.guild_id)
             return
@@ -254,6 +324,7 @@ class GuildMusicState:
             {
                 "voice_channel_id": vc_ch.id,
                 "text_channel_id": int(tc_id),
+                "dj_user_id": int(self.dj_user_id or 0),
                 "current": self._serialize_song(self.current) if self.current else None,
                 "queue": [self._serialize_song(q) for q in list(self.queue)[:100]],
             },
@@ -296,8 +367,16 @@ class GuildMusicState:
         clear_saved_session: bool = True,
     ) -> None:
         """Trennt die Voice-Verbindung zuverlässig & komplett lautlos (ohne Chat-Nachricht)."""
+        self._intentional_disconnect = True
+        if self._prefetch_task and not self._prefetch_task.done():
+            self._prefetch_task.cancel()
+        self._prefetch_task = None
+
         if clear_saved_session:
             clear_active_music_session(self.guild_id)
+            self.dj_user_id = 0
+            self.last_voice_channel_id = 0
+
         self.queue.clear()
         self.current = None
         self.is_loading = False
@@ -359,31 +438,98 @@ def get_music_state(guild_id: int, bot: commands.Bot) -> GuildMusicState:
     return music_states[guild_id]
 
 
-def _count_humans_in_channel(
+def _step_volume(current_pct: int, delta: int) -> int:
+    """10%-Schritte mit Einrasten auf glatte 10er-Werte & garantiertem Stopp auf exakt 100%."""
+    cur = max(5, min(200, int(current_pct)))
+    if delta > 0:
+        if cur < 100 < cur + delta:
+            return 100
+        nxt = ((cur // 10) + 1) * 10 if (cur % 10 != 0) else (cur + delta)
+        return min(200, nxt)
+    if cur + delta < 100 < cur:
+        return 100
+    nxt = (cur // 10) * 10 if (cur % 10 != 0) else (cur + delta)
+    return max(10, nxt)
+
+
+def _human_user_ids_in_channel(
     guild: discord.Guild | None,
     channel: discord.abc.Snowflake | None,
     bot_id: int,
-) -> int:
-    """Zählt echte (nicht-Bot) Nutzer im Voice-Kanal über Gateway voice_states + Member-Liste."""
+) -> list[int]:
+    """Gibt die User-IDs aller echten (nicht-Bot) Nutzer im Voice-Kanal zurück."""
     if guild is None or channel is None:
-        return 0
+        return []
     fresh_ch = guild.get_channel(channel.id) or channel
     vstates = getattr(fresh_ch, "voice_states", None)
     if isinstance(vstates, dict) and vstates:
-        humans = 0
+        ids: list[int] = []
         for uid in vstates:
             if uid == bot_id:
                 continue
             member = guild.get_member(uid)
             if member is not None and member.bot:
                 continue
-            humans += 1
-        return humans
-    return sum(
-        1
+            ids.append(int(uid))
+        return ids
+    return [
+        int(m.id)
         for m in getattr(fresh_ch, "members", [])
         if not m.bot and m.id != bot_id
-    )
+    ]
+
+
+def _count_humans_in_channel(
+    guild: discord.Guild | None,
+    channel: discord.abc.Snowflake | None,
+    bot_id: int,
+) -> int:
+    """Zählt echte (nicht-Bot) Nutzer im Voice-Kanal über Gateway voice_states + Member-Liste."""
+    return len(_human_user_ids_in_channel(guild, channel, bot_id))
+
+
+def claim_or_check_dj(
+    state: GuildMusicState,
+    user: discord.abc.User,
+    user_vc: discord.abc.Snowflake | None,
+    *,
+    require_dj: bool,
+) -> str | None:
+    """
+    Prüft oder vergibt die exklusive DJ-Kontrolle für die laufende Voice-Session:
+    - Ist der Bot noch in keinem Voice-Kanal, erhält `user` als erste Person die Kontrolle (`dj_user_id`).
+    - Ist der Bot bereits in einem Kanal aktiv, muss `user` im selben Voice-Kanal sein.
+    - Bei `require_dj=True` (Buttons, Skip, Pause, Stop, Loop, Shuffle, Volume, Radio) darf NUR
+      die Person steuern, die die Musik zuerst angemacht hat (sofern sie noch im Kanal ist).
+    """
+    guild = state.bot.get_guild(state.guild_id)
+    bot_id = state.bot.user.id if state.bot.user else 0
+    bot_ch = state.active_channel()
+
+    if user_vc is None:
+        return "❌ Du musst in einem Voice-Kanal sein!"
+
+    if bot_ch is None:
+        # Neue Session: Die Person, die zuerst Musik anmacht, bekommt alleinige Kontrolle!
+        state.dj_user_id = int(user.id)
+        return None
+
+    if bot_ch.id != user_vc.id:
+        return f"❌ Der Bot spielt bereits in <#{bot_ch.id}>! Komm in denselben Kanal."
+
+    humans_in_vc = _human_user_ids_in_channel(guild, bot_ch, bot_id)
+    if state.dj_user_id == 0 or (humans_in_vc and state.dj_user_id not in humans_in_vc):
+        # Falls noch kein DJ gesetzt war oder der bisherige DJ den Kanal verlassen hat -> Übergabe!
+        state.dj_user_id = int(user.id)
+        state.persist_session()
+        return None
+
+    if require_dj and int(user.id) != state.dj_user_id:
+        return (
+            f"❌ Nur <@{state.dj_user_id}> kann den Musik-Player bedienen "
+            "(hat die Musik in dieser Runde gestartet)!"
+        )
+    return None
 
 
 async def ensure_voice_connected(
@@ -392,6 +538,8 @@ async def ensure_voice_connected(
 ) -> discord.VoiceClient:
     """Verbindet oder verschiebt den VoiceClient sauber (inkl. Sync mit guild.voice_client)."""
     guild = target_channel.guild
+    state._intentional_disconnect = False
+    state.last_voice_channel_id = target_channel.id
     existing: discord.VoiceClient | None = guild.voice_client or state.voice_client
     if existing is not None:
         if existing.is_connected():
@@ -405,7 +553,7 @@ async def ensure_voice_connected(
         except Exception:
             pass
 
-    vc = await target_channel.connect(self_deaf=True)
+    vc = await target_channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
     state.voice_client = vc
     state.reset_idle()
     return vc
@@ -444,15 +592,20 @@ def _get_reference_url(entry: dict[str, Any], fallback_query: str = "") -> str:
     return fallback_query if _is_url(fallback_query) else ""
 
 
-async def ytdl_extract(query: str, options: dict[str, Any]) -> dict[str, Any] | None:
+async def ytdl_extract(query: str, options: dict[str, Any], cache_tag: str = "search") -> dict[str, Any] | None:
     if not YTDLP_AVAILABLE or not runtime_settings.get("music_enabled", MUSIC_ENABLED):
         return None
     opts = {**YDL_TIMEOUTS, **_cookie_and_pot_opts(), **options}
     loop = asyncio.get_running_loop()
 
     def _run():
-        with yt_dlp.YoutubeDL(opts) as ydl:
+        key = f"{cache_tag}:{opts.get('extract_flat')}:{opts.get('playlistend')}"
+        try:
+            ydl = _get_thread_ydl(key, opts)
             return ydl.extract_info(query, download=False)
+        except Exception:
+            with yt_dlp.YoutubeDL(opts) as fresh_ydl:
+                return fresh_ydl.extract_info(query, download=False)
 
     try:
         return await loop.run_in_executor(None, _run)
@@ -463,7 +616,7 @@ async def ytdl_extract(query: str, options: dict[str, Any]) -> dict[str, Any] | 
 
 async def search_tracks(query: str, limit: int = 5) -> list[dict[str, Any]]:
     q = query if _is_url(query) else f"ytsearch{limit}:{query}"
-    info = await ytdl_extract(q, YTDL_SEARCH_OPTIONS)
+    info = await ytdl_extract(q, YTDL_SEARCH_OPTIONS, cache_tag="flat_search")
     if not info:
         return []
     if "entries" in info:
@@ -472,18 +625,23 @@ async def search_tracks(query: str, limit: int = 5) -> list[dict[str, Any]]:
 
 
 async def extract_playlist(url: str) -> list[dict[str, Any]]:
-    info = await ytdl_extract(url, YTDL_PLAYLIST_OPTIONS)
+    info = await ytdl_extract(url, YTDL_PLAYLIST_OPTIONS, cache_tag="flat_playlist")
     if not info or "entries" not in info:
         return []
     return [e for e in (info["entries"] or []) if e]
 
 
-def _resolve_with_client(webpage_url: str, extra_opts: dict[str, Any] | None = None) -> tuple[str | None, dict | None]:
+def _resolve_with_client(
+    target_query_or_url: str,
+    extra_opts: dict[str, Any] | None = None,
+    client_idx: int = 0,
+) -> tuple[str | None, dict | None]:
     ydl_opts: dict[str, Any] = {
-        "format": "bestaudio/best",
+        "format": BEST_AUDIO_FORMAT,
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
+        "default_search": "ytsearch",
         "source_address": "0.0.0.0",
         "extract_flat": False,
         "nocheckcertificate": True,
@@ -499,16 +657,96 @@ def _resolve_with_client(webpage_url: str, extra_opts: dict[str, Any] | None = N
         if merged_ext:
             ydl_opts["extractor_args"] = merged_ext
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(webpage_url, download=False)
+    cache_key = f"stream_resolve:{client_idx}"
+    try:
+        ydl = _get_thread_ydl(cache_key, ydl_opts)
+        info = ydl.extract_info(target_query_or_url, download=False)
+    except Exception:
+        with yt_dlp.YoutubeDL(ydl_opts) as fresh_ydl:
+            info = fresh_ydl.extract_info(target_query_or_url, download=False)
+
     if not info:
         return None, None
-    if info.get("url"):
+    if info.get("url") and "entries" not in info:
         return info["url"], info
     entries = info.get("entries") or []
-    if entries and entries[0] and entries[0].get("url"):
-        return entries[0]["url"], entries[0]
-    return None, info
+    if entries and entries[0]:
+        first = entries[0]
+        if first.get("url"):
+            return first["url"], first
+        return None, first
+    return info.get("url"), info
+
+
+async def resolve_first_track_fast(
+    query: str,
+    requester: discord.abc.User | None,
+) -> SongInfo | None:
+    """
+    Löst Suche + direkten Opus/M4A-Audio-Stream in EINEM einzigen Schritt auf.
+    Spart beim Start eines neuen Songs einen kompletten zweiten yt-dlp-Aufruf (~50% schneller).
+    """
+    if not YTDLP_AVAILABLE or not runtime_settings.get("music_enabled", MUSIC_ENABLED):
+        return None
+    q = query if _is_url(query) else f"ytsearch1:{query}"
+    loop = asyncio.get_running_loop()
+    for idx, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
+        try:
+            stream_url, info = await loop.run_in_executor(
+                None, _resolve_with_client, q, extra_opts, idx
+            )
+        except Exception:
+            continue
+        if info:
+            ref = _get_reference_url(info, query)
+            if ref or stream_url:
+                return SongInfo(
+                    title=str(info.get("title") or "Unbekannter Titel"),
+                    url=stream_url or "",
+                    webpage_url=ref or (query if _is_url(query) else ""),
+                    duration=int(info.get("duration") or 0),
+                    thumbnail=_entry_thumbnail(info),
+                    requester=requester,
+                    resolved_at=time.monotonic() if stream_url else 0.0,
+                )
+    return None
+
+
+async def _prefetch_song_stream(song: SongInfo) -> None:
+    """Löst im Hintergrund bereits den direkten Audio-Stream des nächsten Queue-Songs auf."""
+    if song.is_radio or song.has_fresh_stream_url() or not song.webpage_url:
+        return
+    loop = asyncio.get_running_loop()
+    for idx, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
+        try:
+            stream_url, info = await loop.run_in_executor(
+                None, _resolve_with_client, song.webpage_url, extra_opts, idx
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+        if stream_url:
+            song.url = stream_url
+            song.resolved_at = time.monotonic()
+            if info:
+                if not song.duration and info.get("duration"):
+                    song.duration = int(info["duration"])
+                if not song.thumbnail:
+                    song.thumbnail = _entry_thumbnail(info)
+            return
+
+
+def schedule_next_prefetch(state: GuildMusicState) -> None:
+    """Startet asynchrones Vorladen für den nächsten Song in `state.queue[0]`."""
+    if not state.queue:
+        return
+    nxt = state.queue[0]
+    if nxt.is_radio or nxt.has_fresh_stream_url() or not nxt.webpage_url:
+        return
+    if state._prefetch_task and not state._prefetch_task.done():
+        return
+    state._prefetch_task = asyncio.create_task(_prefetch_song_stream(nxt))
 
 
 async def _find_autoplay_song(state: GuildMusicState, base_song: SongInfo) -> SongInfo | None:
@@ -655,6 +893,48 @@ def _create_audio_source(
     return discord.FFmpegPCMAudio(stream_url, **fallback_opts)
 
 
+async def _try_start_ffmpeg_stream(
+    state: GuildMusicState,
+    song: SongInfo,
+    stream_url: str,
+    ffmpeg_opts: dict[str, str],
+    after_cb,
+    verify_seconds: float = 0.55,
+) -> bool:
+    """Startet FFmpeg und prüft kurz (~0.55s), ob kein sofortiger HTTP-403/Verbindungsabbruch auftritt."""
+    if not state.voice_client or not state.voice_client.is_connected():
+        return False
+
+    early_error: list[Exception] = []
+    done_flag = asyncio.Event()
+
+    def _wrapped_after(err: Exception | None) -> None:
+        if not done_flag.is_set():
+            if err:
+                early_error.append(err)
+            done_flag.set()
+            return
+        after_cb(err)
+
+    try:
+        source = _create_audio_source(stream_url, ffmpeg_opts, state.volume_pct)
+        state.voice_client.play(source, after=_wrapped_after)
+    except Exception:
+        return False
+
+    try:
+        await asyncio.wait_for(done_flag.wait(), timeout=verify_seconds)
+        # Innerhalb von verify_seconds beendet -> meist 403 Forbidden -> nächsten Client testen!
+        if song.is_radio or song.duration == 0 or song.duration > 3 or early_error:
+            return False
+        # Ultrakurzer Soundeffekt (<= 3s) regulär beendet -> Callback nachreichen!
+        after_cb(None)
+        return True
+    except asyncio.TimeoutError:
+        done_flag.set()
+        return True
+
+
 async def _play_song_robust(
     state: GuildMusicState, song: SongInfo, after_cb
 ) -> bool:
@@ -662,22 +942,28 @@ async def _play_song_robust(
         return False
 
     if song.is_radio and song.url:
-        try:
-            source = _create_audio_source(song.url, RADIO_FFMPEG_OPTIONS, state.volume_pct)
-            state.voice_client.play(source, after=after_cb)
-            await asyncio.sleep(1.5)
-            return state.voice_client.is_playing() or state.voice_client.is_paused()
-        except Exception as e:
-            print(f"❌ [Radio] Stream-Fehler: {e}")
-            return False
+        return await _try_start_ffmpeg_stream(
+            state, song, song.url, RADIO_FFMPEG_OPTIONS, after_cb, verify_seconds=0.8
+        )
 
+    # 1) Blitzstart: Bereits vorab aufgelöste Stream-URL (von /play Direktauflösung oder Queue-Prefetch!)
+    if song.has_fresh_stream_url():
+        if await _try_start_ffmpeg_stream(
+            state, song, song.url, FFMPEG_OPTIONS, after_cb, verify_seconds=0.55
+        ):
+            return True
+        # Falls abgelaufen -> frisch auflösen
+        song.url = ""
+        song.resolved_at = 0.0
+
+    # 2) Frische Auflösung mit optimierter Client-Reihenfolge
     loop = asyncio.get_running_loop()
-    for extra_opts in YDL_PLAYER_CLIENT_FALLBACKS:
+    for idx, extra_opts in enumerate(YDL_PLAYER_CLIENT_FALLBACKS):
         if not state.voice_client or not state.voice_client.is_connected():
             return False
         try:
             stream_url, info = await loop.run_in_executor(
-                None, _resolve_with_client, song.webpage_url, extra_opts
+                None, _resolve_with_client, song.webpage_url, extra_opts, idx
             )
         except Exception:
             continue
@@ -690,38 +976,57 @@ async def _play_song_robust(
             if not song.thumbnail:
                 song.thumbnail = _entry_thumbnail(info)
 
-        early_error: list[Exception] = []
-        done_flag = asyncio.Event()
-
-        def _wrapped_after(err: Exception | None) -> None:
-            if not done_flag.is_set():
-                if err:
-                    early_error.append(err)
-                done_flag.set()
-                return
-            after_cb(err)
-
-        try:
-            source = _create_audio_source(stream_url, FFMPEG_OPTIONS, state.volume_pct)
-            state.voice_client.play(source, after=_wrapped_after)
-        except Exception:
-            continue
-
-        try:
-            await asyncio.wait_for(done_flag.wait(), timeout=2.2)
-            # Innerhalb von 2.2s beendet -> meist 403 Forbidden -> nächsten Client testen!
-            if song.duration == 0 or song.duration > 4 or early_error:
-                continue
-            # Sehr kurzer Soundeffekt (<= 4s) regulär beendet -> Callback nachreichen!
+        if await _try_start_ffmpeg_stream(
+            state, song, stream_url, FFMPEG_OPTIONS, after_cb, verify_seconds=0.55
+        ):
             song.url = stream_url
-            after_cb(None)
-            return True
-        except asyncio.TimeoutError:
-            done_flag.set()
-            song.url = stream_url
+            song.resolved_at = time.monotonic()
             return True
 
     return False
+
+
+async def _wait_or_recover_voice_connection(state: GuildMusicState) -> discord.VoiceClient | None:
+    """
+    Fängt kurze Discord-Voice-Gateway-Reconnects (1–5s) ab, ohne die Session sofort zu zerstören,
+    und stellt die Verbindung bei Bedarf automatisch wieder her, solange Zuhörer im Kanal sind.
+    """
+    guild = state.bot.get_guild(state.guild_id)
+    vc = (guild.voice_client if guild else None) or state.voice_client
+    if vc is not None and vc.is_connected():
+        state.voice_client = vc
+        return vc
+
+    if state._intentional_disconnect:
+        return None
+
+    # Bis zu 5 Sekunden auf laufenden internen discord.py Voice-Reconnect warten
+    for _ in range(10):
+        await asyncio.sleep(0.5)
+        if state._intentional_disconnect:
+            return None
+        guild = state.bot.get_guild(state.guild_id)
+        vc = (guild.voice_client if guild else None) or state.voice_client
+        if vc is not None and vc.is_connected():
+            state.voice_client = vc
+            return vc
+
+    # Falls weiterhin getrennt, aber Zuhörer noch im letzten Kanal warten -> sauber neu verbinden!
+    if guild is not None and state.last_voice_channel_id:
+        target = guild.get_channel(state.last_voice_channel_id)
+        bot_id = state.bot.user.id if state.bot.user else 0
+        if (
+            isinstance(target, (discord.VoiceChannel, discord.StageChannel))
+            and _count_humans_in_channel(guild, target, bot_id) > 0
+            and (time.monotonic() - state._last_auto_reconnect_ts) > 15.0
+        ):
+            state._last_auto_reconnect_ts = time.monotonic()
+            try:
+                print(f"🔄 [Music] Voice-Verbindung in #{target.name} wird automatisch wiederhergestellt...")
+                return await ensure_voice_connected(state, target)
+            except Exception as e:
+                print(f"⚠️ [Music] Auto-Reconnect fehlgeschlagen: {e}")
+    return None
 
 
 async def play_next(state: GuildMusicState, text_channel: discord.abc.Messageable | None = None) -> None:
@@ -731,9 +1036,7 @@ async def play_next(state: GuildMusicState, text_channel: discord.abc.Messageabl
 
     async with state._lock:
         guild = state.bot.get_guild(state.guild_id)
-        vc = state.voice_client or (guild.voice_client if guild else None)
-        if vc is not None and state.voice_client is not vc:
-            state.voice_client = vc
+        vc = await _wait_or_recover_voice_connection(state)
 
         if not vc or not vc.is_connected():
             await state.cleanup()
@@ -810,6 +1113,9 @@ async def play_next(state: GuildMusicState, text_channel: discord.abc.Messageabl
 
         state.consecutive_failures = 0
 
+        # Nächsten Queue-Song im Hintergrund vorladen -> 0s Ladezeit beim nächsten Lied!
+        schedule_next_prefetch(state)
+
         try:
             await state.bot.change_presence(
                 activity=discord.Activity(
@@ -850,6 +1156,8 @@ def build_now_playing_embed(state: GuildMusicState) -> discord.Embed:
     embed.add_field(name="⏱️ Dauer", value=song.duration_str, inline=True)
     embed.add_field(name="👤 Angefragt von", value=req_str, inline=True)
     embed.add_field(name="📋 Queue", value=f"{len(state.queue)} Songs", inline=True)
+    if state.dj_user_id:
+        embed.add_field(name="🎛️ Kontrolle (DJ)", value=f"<@{state.dj_user_id}>", inline=True)
     if song.thumbnail:
         embed.set_thumbnail(url=song.thumbnail)
 
@@ -907,18 +1215,16 @@ class MusicPlayerControlView(discord.ui.View):
         if not self.state.voice_client or not self.state.voice_client.is_connected():
             await interaction.response.send_message("❌ Keine aktive Wiedergabe.", ephemeral=True)
             return False
-        if (
-            isinstance(interaction.user, discord.Member)
-            and interaction.user.voice
-            and interaction.user.voice.channel == self.state.voice_client.channel
-        ):
-            return True
-        if isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator:
-            return True
-        await interaction.response.send_message(
-            "❌ Du musst im selben Voice-Kanal sein, um den Player zu steuern!", ephemeral=True
+        user_vc = (
+            interaction.user.voice.channel
+            if isinstance(interaction.user, discord.Member) and interaction.user.voice
+            else None
         )
-        return False
+        err = claim_or_check_dj(self.state, interaction.user, user_vc, require_dj=True)
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Pause", emoji="⏸️", style=discord.ButtonStyle.secondary, row=0)
     async def btn_pause(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -963,6 +1269,7 @@ class MusicPlayerControlView(discord.ui.View):
         random.shuffle(qlist)
         self.state.queue = deque(qlist)
         self.state.persist_session()
+        schedule_next_prefetch(self.state)
         await interaction.response.send_message(
             f"🔀 **{len(qlist)}** Songs wurden gemischt!", ephemeral=True, delete_after=5
         )
@@ -986,7 +1293,7 @@ class MusicPlayerControlView(discord.ui.View):
     async def btn_vol_down(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check_vc(interaction):
             return
-        self.state.set_volume(self.state.volume_pct - 15)
+        self.state.set_volume(_step_volume(self.state.volume_pct, -10))
         self._sync_labels()
         await interaction.response.edit_message(embed=build_now_playing_embed(self.state), view=self)
 
@@ -994,7 +1301,7 @@ class MusicPlayerControlView(discord.ui.View):
     async def btn_vol_up(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         if not await self._check_vc(interaction):
             return
-        self.state.set_volume(self.state.volume_pct + 15)
+        self.state.set_volume(_step_volume(self.state.volume_pct, +10))
         self._sync_labels()
         await interaction.response.edit_message(embed=build_now_playing_embed(self.state), view=self)
 
@@ -1129,10 +1436,20 @@ class SearchResultSelectView(discord.ui.View):
             await interaction.response.send_message("❌ Du musst in einem Voice-Kanal sein!", ephemeral=True)
             return
 
-        await interaction.response.defer()
-        entry = self.results[int(self.picker.values[0])]
         state = get_music_state(interaction.guild_id, self.bot)
         vc_target = interaction.user.voice.channel
+        err = claim_or_check_dj(
+            state,
+            interaction.user,
+            vc_target,
+            require_dj=bool(state.current and state.current.is_radio),
+        )
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        await interaction.response.defer()
+        entry = self.results[int(self.picker.values[0])]
 
         try:
             await ensure_voice_connected(state, vc_target)
@@ -1141,6 +1458,12 @@ class SearchResultSelectView(discord.ui.View):
                 content=f"❌ Konnte dem Voice-Kanal nicht beitreten: {e}", embed=None, view=None
             )
             return
+
+        if state.current and state.current.is_radio:
+            state.current = None
+            if state.voice_client:
+                state.voice_client.stop()
+            await asyncio.sleep(0.2)
 
         song = SongInfo(
             title=entry.get("title", "Unbekannt"),
@@ -1151,11 +1474,14 @@ class SearchResultSelectView(discord.ui.View):
             requester=interaction.user,
         )
         state.queue.append(song)
+        state.persist_session()
         await interaction.edit_original_response(
             content=f"✅ **{song.title}** ausgewählt!", embed=None, view=None
         )
         if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
             await play_next(state, interaction.channel)
+        else:
+            schedule_next_prefetch(state)
 
 
 async def start_radio_stream(
@@ -1172,6 +1498,14 @@ async def start_radio_stream(
         return
 
     user_vc = interaction.user.voice.channel
+    err = claim_or_check_dj(state, interaction.user, user_vc, require_dj=True)
+    if err is not None:
+        if interaction.response.is_done():
+            await interaction.followup.send(err, ephemeral=True)
+        else:
+            await interaction.response.send_message(err, ephemeral=True)
+        return
+
     try:
         await ensure_voice_connected(state, user_vc)
     except Exception as e:
@@ -1305,11 +1639,14 @@ class MusicCog(commands.Cog, name="Music"):
             if guild is None:
                 continue
             vc_ch = guild.get_channel(int(sess.get("voice_channel_id") or 0))
-            if not isinstance(vc_ch, discord.VoiceChannel) or _count_humans_in_channel(guild, vc_ch, bot_id) == 0:
+            human_ids = _human_user_ids_in_channel(guild, vc_ch, bot_id) if isinstance(vc_ch, (discord.VoiceChannel, discord.StageChannel)) else []
+            if not isinstance(vc_ch, (discord.VoiceChannel, discord.StageChannel)) or not human_ids:
                 clear_active_music_session(gid)
                 continue
             try:
                 state = get_music_state(gid, self.bot)
+                saved_dj = int(sess.get("dj_user_id") or 0)
+                state.dj_user_id = saved_dj if saved_dj in human_ids else human_ids[0]
                 await ensure_voice_connected(state, vc_ch)
                 tc = guild.get_channel(int(sess.get("text_channel_id") or 0))
                 if tc is not None:
@@ -1329,8 +1666,8 @@ class MusicCog(commands.Cog, name="Music"):
         return sum(1 for vc in self.bot.voice_clients if vc.is_connected())
 
     async def _leave_if_still_empty(self, guild_id: int) -> None:
-        """Prüft nach 2s Verzögerung erneut, ob der Bot allein im Voice-Kanal ist, und verlässt ihn lautlos."""
-        await asyncio.sleep(2.0)
+        """Prüft nach 3s Verzögerung erneut, ob der Bot allein im Voice-Kanal ist, und verlässt ihn lautlos."""
+        await asyncio.sleep(3.0)
         guild = self.bot.get_guild(guild_id)
         if guild is None:
             return
@@ -1347,6 +1684,62 @@ class MusicCog(commands.Cog, name="Music"):
             print(f"🎵 [Music] Kanal leer in Guild {guild_id} – verlasse Voice-Kanal lautlos.")
             await state.cleanup()
 
+    async def _handle_unexpected_bot_voice_drop(
+        self,
+        guild_id: int,
+        old_channel_id: int,
+    ) -> None:
+        """
+        Behandelt unerwartete Voice-Trennungen (z. B. Discord Voice-Server-Wechsel oder UDP/DAVE-Glitch):
+        - Wartet kurz auf discord.py's internen Reconnect.
+        - Verbindet sich automatisch neu & spielt nahtlos weiter, falls Musik aktiv war und Zuhörer warten.
+        - Bereinigt andernfalls sauber die Session (inkl. DJ-Reset für die nächste Person).
+        """
+        await asyncio.sleep(2.5)
+        guild = self.bot.get_guild(guild_id)
+        state = music_states.get(guild_id)
+        if guild is None or state is None:
+            return
+        if state._intentional_disconnect:
+            return
+
+        # Hat discord.py die Verbindung bereits selbst wiederhergestellt?
+        vc = guild.voice_client or state.voice_client
+        me_ch = guild.me.voice.channel if (guild.me and guild.me.voice) else None
+        if (vc is not None and vc.is_connected()) or me_ch is not None:
+            if vc is not None:
+                state.voice_client = vc
+            return
+
+        # Falls aktive Wiedergabe lief und noch Zuhörer im Kanal sind -> 1x sauber Auto-Reconnect!
+        bot_id = self.bot.user.id if self.bot.user else 0
+        target_ch = guild.get_channel(old_channel_id)
+        has_music = state.current is not None or bool(state.queue)
+        if (
+            has_music
+            and isinstance(target_ch, (discord.VoiceChannel, discord.StageChannel))
+            and _count_humans_in_channel(guild, target_ch, bot_id) > 0
+            and (time.monotonic() - state._last_auto_reconnect_ts) > 25.0
+        ):
+            state._last_auto_reconnect_ts = time.monotonic()
+            try:
+                print(
+                    f"🔄 [Music] Unerwarteter Voice-Drop in #{target_ch.name} (Guild {guild_id}) "
+                    "– verbinde automatisch neu..."
+                )
+                interrupted = state.current
+                state.current = None
+                if interrupted is not None and (not state.queue or state.queue[0] is not interrupted):
+                    state.queue.appendleft(interrupted)
+                await ensure_voice_connected(state, target_ch)
+                if not state._lock.locked():
+                    await play_next(state, state.text_channel)
+                return
+            except Exception as e:
+                print(f"⚠️ [Music] Auto-Recovery nach Voice-Drop fehlgeschlagen: {e}")
+
+        await state.cleanup(disconnect_voice=False)
+
     @commands.Cog.listener()
     async def on_voice_state_update(
         self,
@@ -1361,9 +1754,15 @@ class MusicCog(commands.Cog, name="Music"):
             if before.channel is not None and after.channel is None:
                 state = music_states.get(member.guild.id)
                 if state:
-                    await state.cleanup(disconnect_voice=False)
+                    if state._intentional_disconnect:
+                        await state.cleanup(disconnect_voice=False)
+                    else:
+                        asyncio.create_task(
+                            self._handle_unexpected_bot_voice_drop(member.guild.id, before.channel.id)
+                        )
             elif after.channel is not None:
                 state = get_music_state(member.guild.id, self.bot)
+                state.last_voice_channel_id = after.channel.id
                 if member.guild.voice_client is not None:
                     state.voice_client = member.guild.voice_client
                 if _count_humans_in_channel(member.guild, after.channel, bot_id) == 0:
@@ -1374,16 +1773,28 @@ class MusicCog(commands.Cog, name="Music"):
         if not member.bot and before.channel is not None:
             if after.channel is None or after.channel.id != before.channel.id:
                 guild = member.guild
-                vc = guild.voice_client or (
-                    music_states[guild.id].voice_client if guild.id in music_states else None
-                )
+                state = music_states.get(guild.id)
+                vc = guild.voice_client or (state.voice_client if state else None)
                 bot_ch = (
                     (guild.me.voice.channel if guild.me and guild.me.voice else None)
                     or (vc.channel if vc else None)
                 )
                 if bot_ch is not None and bot_ch.id == before.channel.id:
-                    if _count_humans_in_channel(guild, bot_ch, bot_id) == 0:
+                    remaining_humans = _human_user_ids_in_channel(guild, bot_ch, bot_id)
+                    if not remaining_humans:
                         asyncio.create_task(self._leave_if_still_empty(guild.id))
+                    elif state and state.dj_user_id == member.id:
+                        # Der bisherige DJ hat den Kanal verlassen -> Kontrolle an nächsten Zuhörer übergeben
+                        state.dj_user_id = remaining_humans[0]
+                        state.persist_session()
+                        if state.last_np_message and state.current:
+                            try:
+                                await state.last_np_message.edit(
+                                    embed=build_now_playing_embed(state),
+                                    view=MusicPlayerControlView(state),
+                                )
+                            except Exception:
+                                pass
 
     # ── Idle Checker Task (verlässt den Kanal bei Leere / Inaktivität komplett lautlos!) ──
 
@@ -1419,16 +1830,24 @@ class MusicCog(commands.Cog, name="Music"):
                 if vc is not None and state.voice_client is not vc:
                     state.voice_client = vc
 
-                # Fall A: Niemand (kein echter Mensch) im Voice-Kanal -> sofort (nach 2s) leaven!
-                humans = _count_humans_in_channel(guild, bot_ch, bot_id)
-                if humans == 0:
+                # Während eines laufenden Voice-Reconnects nicht vorschnell abbrechen
+                if vc is not None and not vc.is_connected() and not state._intentional_disconnect:
+                    if (state.current is not None or state.queue) and state._idle_seconds < 10:
+                        state.increment_idle(2)
+                        continue
+
+                # Fall A: Niemand (kein echter Mensch) im Voice-Kanal -> nach 2 Ticks (4s) lautlos leaven!
+                human_ids = _human_user_ids_in_channel(guild, bot_ch, bot_id)
+                if not human_ids:
                     state._empty_seconds += 2
-                    if state._empty_seconds >= 2:
+                    if state._empty_seconds >= 4:
                         print(f"🎵 [Music] Niemand im Voice-Kanal (Guild {guild.id}) – verlasse Kanal lautlos.")
                         await state.cleanup()
                     continue
 
                 state._empty_seconds = 0
+                if state.dj_user_id == 0 or state.dj_user_id not in human_ids:
+                    state.dj_user_id = human_ids[0]
 
                 # Fall B: Leute sind im Kanal – prüfen ob Musik läuft oder geladen wird
                 is_playing_or_paused = bool(vc and (vc.is_playing() or vc.is_paused()))
@@ -1478,16 +1897,29 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.response.send_message("❌ Du musst in einem Voice-Kanal sein!", ephemeral=True)
             return
 
-        await interaction.response.defer()
         user_vc = interaction.user.voice.channel
         state = get_music_state(interaction.guild_id, self.bot)
 
+        # DJ-Check: Erste Person bekommt die alleinige Steuerung; Kanalwechsel oder Radio-Abbruch durch Fremde blockiert!
+        err = claim_or_check_dj(
+            state,
+            interaction.user,
+            user_vc,
+            require_dj=bool(state.current and state.current.is_radio),
+        )
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
         perms = user_vc.permissions_for(interaction.guild.me)
         if not perms.connect or not perms.speak:
-            await interaction.followup.send(
-                f"❌ Keine Berechtigung (`Verbinden` & `Sprechen`) für **{user_vc.name}**!"
+            await interaction.response.send_message(
+                f"❌ Keine Berechtigung (`Verbinden` & `Sprechen`) für **{user_vc.name}**!",
+                ephemeral=True,
             )
             return
+
+        await interaction.response.defer()
 
         state.is_loading = True
         try:
@@ -1497,7 +1929,7 @@ class MusicCog(commands.Cog, name="Music"):
                 await interaction.followup.send(f"❌ Konnte dem Voice-Kanal nicht beitreten: {e}")
                 return
 
-            # Falls Radio lief -> beenden für reguläre Queue
+            # Falls Radio lief -> beenden für reguläre Queue (nur DJ darf das, oben geprüft)
             if state.current and state.current.is_radio:
                 state.current = None
                 if state.voice_client:
@@ -1505,6 +1937,13 @@ class MusicCog(commands.Cog, name="Music"):
                 await asyncio.sleep(0.2)
 
             state.reset_idle()
+            idle_now = (
+                state.voice_client is not None
+                and not state.voice_client.is_playing()
+                and not state.voice_client.is_paused()
+                and state.current is None
+                and not state.queue
+            )
 
             # 1) Spotify
             if is_spotify_url(query):
@@ -1514,28 +1953,41 @@ class MusicCog(commands.Cog, name="Music"):
                     return
                 if len(sp_tracks) == 1:
                     sp = sp_tracks[0]
-                    results = await search_tracks(sp["search_query"], limit=1)
-                    if not results:
-                        await interaction.followup.send(f"❌ Konnte **{sp['title']}** nicht auf YouTube finden.")
-                        return
-                    entry = results[0]
-                    song = SongInfo(
-                        title=sp["title"],
-                        url="",
-                        webpage_url=_get_reference_url(entry),
-                        duration=sp.get("duration") or int(entry.get("duration") or 0),
-                        thumbnail=sp.get("thumbnail") or _entry_thumbnail(entry),
-                        requester=interaction.user,
-                    )
+                    if idle_now:
+                        song = await resolve_first_track_fast(sp["search_query"], interaction.user)
+                        if not song:
+                            await interaction.followup.send(f"❌ Konnte **{sp['title']}** nicht auf YouTube finden.")
+                            return
+                        song.title = sp["title"]
+                        if sp.get("duration"):
+                            song.duration = int(sp["duration"])
+                        if sp.get("thumbnail"):
+                            song.thumbnail = sp["thumbnail"]
+                    else:
+                        results = await search_tracks(sp["search_query"], limit=1)
+                        if not results:
+                            await interaction.followup.send(f"❌ Konnte **{sp['title']}** nicht auf YouTube finden.")
+                            return
+                        entry = results[0]
+                        song = SongInfo(
+                            title=sp["title"],
+                            url="",
+                            webpage_url=_get_reference_url(entry),
+                            duration=sp.get("duration") or int(entry.get("duration") or 0),
+                            thumbnail=sp.get("thumbnail") or _entry_thumbnail(entry),
+                            requester=interaction.user,
+                        )
                     state.queue.append(song)
+                    state.persist_session()
                     if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
-                        msg = await interaction.followup.send(f"🟢 **{sp['title']}** wird geladen...", wait=True)
+                        msg = await interaction.followup.send(f"🟢 **{sp['title']}** startet...", wait=True)
                         try:
-                            await msg.delete(delay=4)
+                            await msg.delete(delay=3)
                         except Exception:
                             pass
                         await play_next(state, interaction.channel)
                     else:
+                        schedule_next_prefetch(state)
                         embed = discord.Embed(
                             title="➕ Spotify → Warteschlange",
                             description=f"🟢 **{song.title}**",
@@ -1548,19 +2000,29 @@ class MusicCog(commands.Cog, name="Music"):
                         await interaction.followup.send(embed=embed)
                     return
 
-                # Spotify Playlist / Album (ersten Track sofort auflösen, Rest asynchron)
+                # Spotify Playlist / Album (ersten Track sofort direkt auflösen, Rest asynchron)
                 first = sp_tracks[0]
-                first_res = await search_tracks(first["search_query"], limit=1)
-                if first_res:
-                    e0 = first_res[0]
-                    state.queue.append(
-                        SongInfo(
-                            first["title"], "", _get_reference_url(e0),
-                            first.get("duration") or int(e0.get("duration") or 0),
-                            first.get("thumbnail") or _entry_thumbnail(e0),
-                            interaction.user,
+                if idle_now:
+                    first_song = await resolve_first_track_fast(first["search_query"], interaction.user)
+                    if first_song:
+                        first_song.title = first["title"]
+                        if first.get("duration"):
+                            first_song.duration = int(first["duration"])
+                        if first.get("thumbnail"):
+                            first_song.thumbnail = first["thumbnail"]
+                        state.queue.append(first_song)
+                else:
+                    first_res = await search_tracks(first["search_query"], limit=1)
+                    if first_res:
+                        e0 = first_res[0]
+                        state.queue.append(
+                            SongInfo(
+                                first["title"], "", _get_reference_url(e0),
+                                first.get("duration") or int(e0.get("duration") or 0),
+                                first.get("thumbnail") or _entry_thumbnail(e0),
+                                interaction.user,
+                            )
                         )
-                    )
 
                 async def _queue_remaining() -> None:
                     for sp in sp_tracks[1:]:
@@ -1575,7 +2037,9 @@ class MusicCog(commands.Cog, name="Music"):
                                     interaction.user,
                                 )
                             )
+                            schedule_next_prefetch(state)
                         await asyncio.sleep(0.2)
+                    state.persist_session()
 
                 asyncio.create_task(_queue_remaining())
                 embed = discord.Embed(
@@ -1586,6 +2050,8 @@ class MusicCog(commands.Cog, name="Music"):
                 await interaction.followup.send(embed=embed)
                 if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
                     await play_next(state, interaction.channel)
+                else:
+                    schedule_next_prefetch(state)
                 return
 
             # 2) YouTube Playlist
@@ -1610,6 +2076,7 @@ class MusicCog(commands.Cog, name="Music"):
                         )
                     )
                     added += 1
+                state.persist_session()
                 embed = discord.Embed(
                     title="📋 Playlist hinzugefügt",
                     description=f"**{added}** Songs zur Warteschlange hinzugefügt!",
@@ -1618,32 +2085,44 @@ class MusicCog(commands.Cog, name="Music"):
                 await interaction.followup.send(embed=embed)
                 if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
                     await play_next(state, interaction.channel)
+                else:
+                    schedule_next_prefetch(state)
                 return
 
             # 3) Einzelner Song / Direktlink
-            results = await search_tracks(query, limit=1)
-            if not results:
-                await interaction.followup.send(f"❌ Keine Ergebnisse für: `{query}`")
-                return
-            entry = results[0]
-            song = SongInfo(
-                title=entry.get("title", "Unbekannt"),
-                url="",
-                webpage_url=_get_reference_url(entry, query),
-                duration=int(entry.get("duration") or 0),
-                thumbnail=_entry_thumbnail(entry),
-                requester=interaction.user,
-            )
+            if idle_now:
+                # 1-Schritt-Schnellstart: Suche + direkter Opus/M4A-Stream in einem Aufruf!
+                song = await resolve_first_track_fast(query, interaction.user)
+                if not song:
+                    await interaction.followup.send(f"❌ Keine Ergebnisse für: `{query}`")
+                    return
+            else:
+                results = await search_tracks(query, limit=1)
+                if not results:
+                    await interaction.followup.send(f"❌ Keine Ergebnisse für: `{query}`")
+                    return
+                entry = results[0]
+                song = SongInfo(
+                    title=entry.get("title", "Unbekannt"),
+                    url="",
+                    webpage_url=_get_reference_url(entry, query),
+                    duration=int(entry.get("duration") or 0),
+                    thumbnail=_entry_thumbnail(entry),
+                    requester=interaction.user,
+                )
+
             state.queue.append(song)
+            state.persist_session()
 
             if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
-                msg = await interaction.followup.send(f"🎵 **{song.title}** wird geladen...", wait=True)
+                msg = await interaction.followup.send(f"🎵 **{song.title}** startet...", wait=True)
                 try:
-                    await msg.delete(delay=4)
+                    await msg.delete(delay=3)
                 except Exception:
                     pass
                 await play_next(state, interaction.channel)
             else:
+                schedule_next_prefetch(state)
                 embed = discord.Embed(
                     title="➕ Zur Warteschlange hinzugefügt",
                     description=f"[{song.title}]({song.webpage_url})",
@@ -1691,6 +2170,15 @@ class MusicCog(commands.Cog, name="Music"):
         if not state.voice_client or (not state.voice_client.is_playing() and not state.voice_client.is_paused()):
             await interaction.response.send_message("❌ Es wird gerade nichts abgespielt.", ephemeral=True)
             return
+        user_vc = (
+            interaction.user.voice.channel
+            if isinstance(interaction.user, discord.Member) and interaction.user.voice
+            else None
+        )
+        err = claim_or_check_dj(state, interaction.user, user_vc, require_dj=True)
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
         if state.loop_mode == "track":
             state.loop_mode = "off"
         state.voice_client.stop()
@@ -1701,6 +2189,15 @@ class MusicCog(commands.Cog, name="Music"):
         state = get_music_state(interaction.guild_id, self.bot)
         if not state.voice_client or not state.voice_client.is_connected():
             await interaction.response.send_message("❌ Ich bin in keinem Voice-Kanal.", ephemeral=True)
+            return
+        user_vc = (
+            interaction.user.voice.channel
+            if isinstance(interaction.user, discord.Member) and interaction.user.voice
+            else None
+        )
+        err = claim_or_check_dj(state, interaction.user, user_vc, require_dj=True)
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
             return
         await state.cleanup()
         await interaction.response.send_message(
@@ -1717,6 +2214,16 @@ class MusicCog(commands.Cog, name="Music"):
     @app_commands.command(name="shuffle", description="🎵 Mischt die Warteschlange zufällig")
     async def cmd_shuffle(self, interaction: discord.Interaction) -> None:
         state = get_music_state(interaction.guild_id, self.bot)
+        if state.active_channel() is not None:
+            user_vc = (
+                interaction.user.voice.channel
+                if isinstance(interaction.user, discord.Member) and interaction.user.voice
+                else None
+            )
+            err = claim_or_check_dj(state, interaction.user, user_vc, require_dj=True)
+            if err is not None:
+                await interaction.response.send_message(err, ephemeral=True)
+                return
         if len(state.queue) < 2:
             await interaction.response.send_message("❌ Zu wenig Songs zum Mischen.", ephemeral=True)
             return
@@ -1724,6 +2231,7 @@ class MusicCog(commands.Cog, name="Music"):
         random.shuffle(qlist)
         state.queue = deque(qlist)
         state.persist_session()
+        schedule_next_prefetch(state)
         await interaction.response.send_message(f"🔀 **{len(qlist)}** Songs wurden gemischt!", delete_after=10)
 
     @app_commands.command(
@@ -1739,6 +2247,16 @@ class MusicCog(commands.Cog, name="Music"):
     )
     async def cmd_autoplay(self, interaction: discord.Interaction, mode: str) -> None:
         state = get_music_state(interaction.guild_id, self.bot)
+        if state.active_channel() is not None:
+            user_vc = (
+                interaction.user.voice.channel
+                if isinstance(interaction.user, discord.Member) and interaction.user.voice
+                else None
+            )
+            err = claim_or_check_dj(state, interaction.user, user_vc, require_dj=True)
+            if err is not None:
+                await interaction.response.send_message(err, ephemeral=True)
+                return
         state.autoplay = mode == "on"
         set_guild_music_prefs(interaction.guild_id, autoplay=state.autoplay)
         if state.autoplay:
@@ -1775,6 +2293,12 @@ class MusicCog(commands.Cog, name="Music"):
             return
         if not isinstance(interaction.user, discord.Member) or not interaction.user.voice or not interaction.user.voice.channel:
             await interaction.response.send_message("❌ Du musst in einem Voice-Kanal sein!", ephemeral=True)
+            return
+
+        state = get_music_state(interaction.guild_id, self.bot)
+        err = claim_or_check_dj(state, interaction.user, interaction.user.voice.channel, require_dj=True)
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
             return
 
         if sender is None:
@@ -1869,18 +2393,15 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        if state.voice_client and state.voice_client.is_connected():
-            is_in_same_vc = (
-                isinstance(interaction.user, discord.Member)
-                and interaction.user.voice
-                and interaction.user.voice.channel == state.voice_client.channel
+        if state.active_channel() is not None:
+            user_vc = (
+                interaction.user.voice.channel
+                if isinstance(interaction.user, discord.Member) and interaction.user.voice
+                else None
             )
-            is_admin = isinstance(interaction.user, discord.Member) and interaction.user.guild_permissions.administrator
-            if not is_in_same_vc and not is_admin:
-                await interaction.response.send_message(
-                    "❌ Du musst im selben Voice-Kanal sein, um die Lautstärke während der Wiedergabe zu ändern!",
-                    ephemeral=True,
-                )
+            err = claim_or_check_dj(state, interaction.user, user_vc, require_dj=True)
+            if err is not None:
+                await interaction.response.send_message(err, ephemeral=True)
                 return
 
         new_pct = state.set_volume(prozent)
@@ -2181,8 +2702,13 @@ class FavoritesView(discord.ui.View):
 
         chosen = self.favs[idx]
         state = get_music_state(interaction.guild_id, self.bot)
+        user_vc = interaction.user.voice.channel
 
         if chosen.get("is_radio"):
+            err = claim_or_check_dj(state, interaction.user, user_vc, require_dj=True)
+            if err is not None:
+                await interaction.response.send_message(err, ephemeral=True)
+                return
             await interaction.response.defer(ephemeral=True)
             station = {
                 "name": str(chosen.get("title", "Radio")).removeprefix("📻 ").strip(),
@@ -2192,9 +2718,19 @@ class FavoritesView(discord.ui.View):
             await start_radio_stream(interaction, station, state)
             return
 
+        err = claim_or_check_dj(
+            state,
+            interaction.user,
+            user_vc,
+            require_dj=bool(state.current and state.current.is_radio),
+        )
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
         await interaction.response.defer(ephemeral=True)
         try:
-            await ensure_voice_connected(state, interaction.user.voice.channel)
+            await ensure_voice_connected(state, user_vc)
         except Exception as e:
             await interaction.followup.send(f"❌ Konnte Voice-Kanal nicht beitreten: {e}", ephemeral=True)
             return
@@ -2214,10 +2750,12 @@ class FavoritesView(discord.ui.View):
             requester=interaction.user,
         )
         state.queue.append(song)
+        state.persist_session()
         if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
             await play_next(state, interaction.channel)
             await interaction.followup.send(f"▶️ Starte Favorit: **{song.title}**", ephemeral=True)
         else:
+            schedule_next_prefetch(state)
             await interaction.followup.send(
                 f"➕ Favorit **{song.title}** auf Position `#{len(state.queue)}` eingereiht!",
                 ephemeral=True,
@@ -2238,10 +2776,21 @@ class FavoritesView(discord.ui.View):
             )
             return
 
-        await interaction.response.defer(ephemeral=True)
+        user_vc = interaction.user.voice.channel
         state = get_music_state(interaction.guild_id, self.bot)
+        err = claim_or_check_dj(
+            state,
+            interaction.user,
+            user_vc,
+            require_dj=bool(state.current and state.current.is_radio),
+        )
+        if err is not None:
+            await interaction.response.send_message(err, ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True)
         try:
-            await ensure_voice_connected(state, interaction.user.voice.channel)
+            await ensure_voice_connected(state, user_vc)
         except Exception as e:
             await interaction.followup.send(f"❌ Konnte Voice-Kanal nicht beitreten: {e}", ephemeral=True)
             return
@@ -2266,9 +2815,12 @@ class FavoritesView(discord.ui.View):
                     requester=interaction.user,
                 )
             )
+        state.persist_session()
 
         if state.voice_client and not state.voice_client.is_playing() and not state.voice_client.is_paused() and state.current is None:
             await play_next(state, interaction.channel)
+        else:
+            schedule_next_prefetch(state)
 
         mode_txt = "gemischt " if shuffle else ""
         await interaction.followup.send(

@@ -50,6 +50,14 @@ def check_system_requirements() -> bool:
     else:
         print("  🔐 PyNaCl:  ❌ fehlt – pip install PyNaCl")
 
+    if importlib.util.find_spec("davey") is not None:
+        print(f"  🛡️ DAVE:    ✅ Discord Voice-E2EE bereit (discord.py {discord.__version__})")
+    else:
+        print(
+            f"  🛡️ DAVE:    ⚠️ 'davey' fehlt (discord.py {discord.__version__}) – "
+            "für stabile Voice-Verbindungen bitte ausführen: pip install -U 'discord.py[voice]' yt-dlp"
+        )
+
     try:
         import yt_dlp
         print(f"  🎵 yt-dlp:  ✅ {yt_dlp.version.__version__}")
