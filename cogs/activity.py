@@ -33,6 +33,7 @@ from bot_core.config import (
     COLOR_SUCCESS,
     COLOR_TWITCH,
     COLOR_WARNING,
+    GUILD_ID,
     MOD_ROLE_NAME,
     MONTH_NAMES,
     REVIEW_CHANNEL_ID,
@@ -41,6 +42,7 @@ from bot_core.config import (
     now_berlin,
     today_berlin,
 )
+from bot_core.server_store import get_dynamic_channel_id
 from bot_core.storage import (
     add_absence,
     add_absence_range,
@@ -389,7 +391,13 @@ class ActivityCog(commands.Cog, name="Activity"):
 
     @tasks.loop(minutes=1)
     async def review_scheduler(self) -> None:
-        if not REVIEW_CHANNEL_ID:
+        rev_ch_id = get_dynamic_channel_id(GUILD_ID, "review_channel_id", REVIEW_CHANNEL_ID)
+        if not rev_ch_id:
+            for g in self.bot.guilds:
+                rev_ch_id = get_dynamic_channel_id(g.id, "review_channel_id", REVIEW_CHANNEL_ID)
+                if rev_ch_id:
+                    break
+        if not rev_ch_id:
             return
         now_de = now_berlin()
         today = now_de.date()
@@ -398,7 +406,7 @@ class ActivityCog(commands.Cog, name="Activity"):
         if today.day == last_day and now_de.hour == 22 and now_de.minute == 0:
             key = f"m-{today.year}-{today.month}"
             if not is_review_already_sent(key):
-                channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
+                channel = self.bot.get_channel(rev_ch_id)
                 if channel and getattr(channel, "guild", None):
                     mark_review_already_sent(key)
                     try:
@@ -409,7 +417,7 @@ class ActivityCog(commands.Cog, name="Activity"):
         if today.month == 12 and today.day == 1 and now_de.hour == 22 and now_de.minute == 0:
             key = f"y-{today.year}"
             if not is_review_already_sent(key):
-                channel = self.bot.get_channel(REVIEW_CHANNEL_ID)
+                channel = self.bot.get_channel(rev_ch_id)
                 if channel and getattr(channel, "guild", None):
                     mark_review_already_sent(key)
                     try:
@@ -858,7 +866,8 @@ class ActivityCog(commands.Cog, name="Activity"):
         if m < 1 or m > 12:
             await interaction.followup.send("❌ Ungültiger Monat (1–12).", ephemeral=True)
             return
-        review_channel = self.bot.get_channel(REVIEW_CHANNEL_ID) or interaction.channel
+        rev_id = get_dynamic_channel_id(interaction.guild_id, "review_channel_id", REVIEW_CHANNEL_ID)
+        review_channel = (self.bot.get_channel(rev_id) if rev_id else None) or interaction.channel
         await send_monthly_review(review_channel, interaction.guild, y, m)
         await interaction.followup.send(
             f"✅ Monatsbericht für **{MONTH_NAMES[m]} {y}** gesendet!", ephemeral=True
@@ -872,7 +881,8 @@ class ActivityCog(commands.Cog, name="Activity"):
     ) -> None:
         await interaction.response.defer(ephemeral=True)
         y = jahr if jahr is not None else today_berlin().year
-        review_channel = self.bot.get_channel(REVIEW_CHANNEL_ID) or interaction.channel
+        rev_id = get_dynamic_channel_id(interaction.guild_id, "review_channel_id", REVIEW_CHANNEL_ID)
+        review_channel = (self.bot.get_channel(rev_id) if rev_id else None) or interaction.channel
         await send_yearly_review(review_channel, interaction.guild, y)
         await interaction.followup.send(f"✅ Jahresbericht für **{y}** gesendet!", ephemeral=True)
 

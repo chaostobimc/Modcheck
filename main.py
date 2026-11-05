@@ -36,6 +36,8 @@ from bot_core.stats import stats_tracker
 from bot_core.storage import flush_data
 from bot_core.twitch_service import TwitchBot
 from cogs import COG_EXTENSIONS
+from cogs.community import PersistentGiveawayButton, PersistentPollButton
+from cogs.roles import PersistentRoleButton, PersistentRoleSelect
 
 
 def check_system_requirements() -> bool:
@@ -80,6 +82,12 @@ class ModcheckBot(commands.Bot):
         self.tree.on_error = self.on_app_command_error
 
     async def setup_hook(self) -> None:
+        self.add_dynamic_items(
+            PersistentRoleButton,
+            PersistentRoleSelect,
+            PersistentGiveawayButton,
+            PersistentPollButton,
+        )
         loaded = 0
         for ext in COG_EXTENSIONS:
             try:

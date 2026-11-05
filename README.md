@@ -1,4 +1,4 @@
-# 🚀 Modcheck v2.1 — Discord & Twitch Bot
+# 🚀 Modcheck v3.0 — Discord & Twitch Bot
 
 Ein modularer, extrem ressourcenschonender All-in-One Community-Bot für **Discord** und **Twitch** — optimiert für den Dauerbetrieb (24/7) auf einem **Raspberry Pi 5**.
 
@@ -29,6 +29,25 @@ Ein modularer, extrem ressourcenschonender All-in-One Community-Bot für **Disco
 
 ---
 
+## 🧩 All-in-One-Module einrichten
+
+Nach dem Start stehen `/feature-status` (Admin-Setup), `/help` und `/status` zur Verfügung. Im Setup-Center können viele Kanal- und Rollenzuordnungen pro Server ohne Neustart geändert werden; Spezialoptionen liegen in den jeweiligen Befehlsgruppen:
+
+- `/birthday`: Geburtstage und Tagesrolle; der 29. Februar wird in Nicht-Schaltjahren am 28. Februar gefeiert.
+- `/counting`: Zählkanal, Wechsel der Teilnehmer und Highscore.
+- `/rank` und `/levels`: Chat-/Voice-XP, Levelrollen, Coin-Boni und MEE6-Import. Das Leaderboard muss für den direkten MEE6-Abruf erreichbar sein. Alternativ `python tools/export_mee6.py SERVER_ID` ausführen und die JSON-Datei mit `/levels import-mee6` hochladen. Der tatsächliche Zugriff hängt von MEE6 und dessen API ab.
+- `/roles` und `/welcome`: Rollenpanels, Reaction-/Auto-/Sticky-Rollen, Begrüßungen, Boosts und Statistikkanäle.
+- `/mod`, `/automod` und `/logs`: Moderationsfälle, konfigurierbare Filter und Audit-Kanäle. Automatische Warn-Eskalationen müssen ausdrücklich eingerichtet werden.
+- `/giveaway`, `/poll`, `/suggest`, `/starboard`, `/customcmd` und `/afk`: Community-Funktionen.
+
+Im Discord Developer Portal **Server Members Intent** und **Message Content Intent** aktivieren; für Online-Zähler zusätzlich **Presence Intent**. Der Bot benötigt die jeweils passenden Kanal-, Nachrichten-, Rollen- und Moderationsrechte, und seine höchste Rolle muss über Rollen bzw. Mitgliedern stehen, die er verwalten soll. Persistente Rollen-, Giveaway- und Umfrage-Buttons funktionieren nach Neustarts weiter.
+
+Die neuen Daten liegen in `server_config.json`, `birthdays.json`, `counting.json`, `levels.json`, `roles_config.json`, `moderation.json` und `community.json`. Diese Dateien sind aus Git ausgeschlossen: **regelmäßig zusammen mit den bestehenden Bot-Daten sichern**, insbesondere vor Updates oder Migrationen. Discord-Events und MEE6-Import sollten auf einem Testserver überprüft werden; ein Offline-Test kann keine echten API-Rechte oder Netzwerkzugriffe prüfen.
+
+Tests lokal ausführen: `python -m unittest discover -s tests -v` (nach Installation der Abhängigkeiten).
+
+---
+
 ## 🗂️ Projektstruktur
 
 ```text
@@ -41,7 +60,7 @@ Modcheck/
 │   ├── checks.py            # Slash-Command-Berechtigungs- & Kanal-Checks
 │   ├── activity_helpers.py  # Aktivitäts-Scores, Kalender, 24h-Profile & Berichte
 │   └── twitch_service.py    # Twitch IRC Client, Stream-Metadaten & Helix API Service
-├── cogs/                    # Modulare Discord.py Cogs (74 Slash-Commands)
+├── cogs/                    # Modulare Discord.py Cogs (98 Top-Level Slash-Commands)
 │   ├── general.py           # /help, /status, /profile, /userinfo, /remind & Logs
 │   ├── activity.py          # Twitch-Tracking, /activity, /teamstatus, /streams, /absent, Reviews
 │   ├── tickets.py           # Persistentes Ticket-System & Transkripte

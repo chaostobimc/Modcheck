@@ -15,6 +15,7 @@ from bot_core.config import (
     TEMP_VOICE_CATEGORY_ID,
     TEMP_VOICE_CHANNEL_ID,
 )
+from bot_core.server_store import get_dynamic_channel_id
 from bot_core.stats import stats_tracker
 from bot_core.storage import (
     clear_temp_voice_prefs,
@@ -747,9 +748,12 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                 await update_temp_voice_panel(guild, vid)
 
         # Falls während des Neustarts jemand im Trigger-Kanal wartet -> sofort Temp-VC erstellen
-        if initial and TEMP_VOICE_CHANNEL_ID:
+        if initial:
             for guild in list(self.bot.guilds):
-                trig = guild.get_channel(TEMP_VOICE_CHANNEL_ID)
+                trig_id = get_dynamic_channel_id(guild.id, "temp_voice_channel_id", TEMP_VOICE_CHANNEL_ID)
+                if not trig_id:
+                    continue
+                trig = guild.get_channel(trig_id)
                 if isinstance(trig, discord.VoiceChannel):
                     for mem in list(trig.members):
                         if not mem.bot:
@@ -775,9 +779,11 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
 
     async def _create_temp_vc(self, member: discord.Member, guild: discord.Guild) -> None:
         try:
-            category = guild.get_channel(TEMP_VOICE_CATEGORY_ID) if TEMP_VOICE_CATEGORY_ID else None
+            cat_id = get_dynamic_channel_id(guild.id, "temp_voice_category_id", TEMP_VOICE_CATEGORY_ID)
+            trig_id = get_dynamic_channel_id(guild.id, "temp_voice_channel_id", TEMP_VOICE_CHANNEL_ID)
+            category = guild.get_channel(cat_id) if cat_id else None
             if not isinstance(category, discord.CategoryChannel):
-                trigger = guild.get_channel(TEMP_VOICE_CHANNEL_ID)
+                trigger = guild.get_channel(trig_id) if trig_id else None
                 category = trigger.category if trigger else None
 
             saved = get_temp_voice_prefs(member.id)
@@ -970,7 +976,8 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
                 except Exception:
                     pass
 
-        if not TEMP_VOICE_CHANNEL_ID:
+        trig_id = get_dynamic_channel_id(member.guild.id, "temp_voice_channel_id", TEMP_VOICE_CHANNEL_ID)
+        if not trig_id:
             return
 
         # 1) Zuerst alten Temp-Kanal bereinigen (auch bei direktem Wechsel in anderen Kanal!)
@@ -982,7 +989,7 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
             asyncio.create_task(self._handle_temp_vc_leave(member, before.channel.id))
 
         # 2) Beitritt in Trigger-Kanal → Neuen Temp-VC erstellen
-        if after.channel is not None and after.channel.id == TEMP_VOICE_CHANNEL_ID:
+        if after.channel is not None and after.channel.id == trig_id:
             await self._create_temp_vc(member, member.guild)
             return
 
@@ -990,7 +997,7 @@ class TempVoiceCog(commands.Cog, name="TempVoice"):
         if (
             after.channel is not None
             and after.channel.id in temp_voice_channels
-            and after.channel.id != TEMP_VOICE_CHANNEL_ID
+            and after.channel.id != trig_id
         ):
             cid = after.channel.id
             vc_data = temp_voice_channels.get(cid)

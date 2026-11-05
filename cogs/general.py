@@ -33,6 +33,7 @@ from bot_core.config import (
     GAMBLING_CHANNEL_ID,
     MESSAGE_LOG_CHANNEL_ID,
     MOD_ROLE_NAME,
+    MONTH_NAMES,
     MUSIC_ENABLED,
     REVIEW_CHANNEL_ID,
     STREAMER_CHANNEL,
@@ -40,9 +41,9 @@ from bot_core.config import (
     TWITCH_LOG_CHANNEL_ID,
     USERINFO_CHANNEL_ID,
     now_berlin,
-    runtime_settings,
     today_berlin,
 )
+from bot_core.server_store import get_dynamic_channel_id
 from bot_core.stats import bot_runtime, stats_tracker
 from bot_core.storage import (
     add_persistent_reminder,
@@ -56,6 +57,9 @@ from bot_core.storage import (
     pop_due_reminders,
 )
 from bot_core.twitch_service import is_stream_currently_live_cached
+from cogs.birthdays import get_user_birthday_info
+from cogs.leveling import get_user_level_snapshot
+from cogs.moderation import get_active_warn_count
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -286,6 +290,7 @@ def _build_help_embed(category: str) -> discord.Embed:
         embed.add_field(
             name="🛠️ Profile, Akten & Reminder",
             value=(
+                "`/feature-status` — **🎛️ Admin-Setup-Center (Kanäle & Rollen ohne `.env` zuweisen!)**\n"
                 "`/profile [user]` — Community-Profilkarte anzeigen\n"
                 "`/userinfo [user]` — Vollständige Moderator-Akte\n"
                 "`/remind <zeit> <text>` — Erinnerung setzen (`10s`, `5m`, `2h`, `1d`)\n"
@@ -295,15 +300,139 @@ def _build_help_embed(category: str) -> discord.Embed:
         )
         return embed
 
+    if category == "level_bday":
+        embed = discord.Embed(
+            title="📈 Leveling (MEE6), 🎂 Geburtstage & 🔢 Counting",
+            description="Exakte MEE6-XP-Kurve inkl. Import, 24h-Geburtstagsrolle & Counting-Spiel.",
+            color=COLOR_GOLD,
+            timestamp=now,
+        )
+        embed.add_field(
+            name="📈 Level- & XP-System (100% MEE6-kompatibel)",
+            value=(
+                "`/rank [user]` — Rang-Karte mit Fortschrittsbalken & Server-Platz\n"
+                "`/levels leaderboard` — XP-Rangliste mit Seitennavigation\n"
+                "`/levels rewards` — Alle Level-Rollen & Coin-Prämien\n"
+                "`/levels reward-add` / `reward-remove` — Level-Rollen verwalten (Admins)\n"
+                "`/levels import-mee6` — **Alle MEE6-Level & XP ohne Verlust importieren!**\n"
+                "`/levels setup` • `/levels set-level` • `/levels set-xp` • `/levels export`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🎂 Geburtstags-System",
+            value=(
+                "`/birthday set <tag> <monat> [jahr]` — Eigenen Geburtstag speichern\n"
+                "`/birthday show [user]` — Geburtstag, Sternzeichen & Countdown\n"
+                "`/birthday upcoming` — Nächste Geburtstage auf dem Server\n"
+                "`/birthday setup` — 24h-Rolle, Kanal & Coin-Geschenk festlegen (Admins)"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🔢 Counting-Spiel",
+            value=(
+                "`/counting stats [user]` — Aktueller Stand, Highscore & Trefferquote\n"
+                "`/counting leaderboard` — Beste Zähler des Servers\n"
+                "`/counting setup` • `/counting set` • `/counting disable` (Admins)"
+            ),
+            inline=False,
+        )
+        return embed
+
+    if category == "roles_welcome":
+        embed = discord.Embed(
+            title="🎭 Rollen-Panels, 👋 Welcome & 📊 Server-Stats",
+            description="Vollständiger Carl-bot & ProBot Ersatz für Rollen und Begrüßungen.",
+            color=0x5865F2,
+            timestamp=now,
+        )
+        embed.add_field(
+            name="🎭 Self-Roles, Reaction-Roles & Auto-Role",
+            value=(
+                "`/roles panel-create` — Button- oder Dropdown-Rollenpanel erstellen\n"
+                "`/roles panel-add-role` / `panel-remove-role` — Rollen im Panel verwalten\n"
+                "`/roles reaction-add` — Klassische Emoji-Reaction-Role auf beliebiger Nachricht\n"
+                "`/roles autorole-human` / `autorole-bot` — Automatische Beitritts-Rollen\n"
+                "`/roles sticky <aktiv>` — Rollen bei Wiedereintritt automatisch wiederherstellen\n"
+                "`/roles give-all <rolle>` — Rolle an alle Mitglieder vergeben"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="👋 Welcome, Leave, Boost & Live-Counter",
+            value=(
+                "`/welcome setup-join` / `setup-dm` / `setup-leave` / `setup-boost`\n"
+                "`/welcome test <join/leave/boost>` — Live-Vorschau senden\n"
+                "`/welcome counter-create` — Live-Statistik-Sprachkanal (Mitglieder, Boosts, Online)"
+            ),
+            inline=False,
+        )
+        return embed
+
+    if category == "moderation_suite":
+        embed = discord.Embed(
+            title="🛡️ Moderation, 🤖 AutoMod, 📋 Logs & 🎉 Community",
+            description="Moderations-Cases, AutoMod-Filter, 4-Kanal Audit-Logs, Giveaways & mehr.",
+            color=COLOR_ERROR,
+            timestamp=now,
+        )
+        embed.add_field(
+            name="🛡️ Moderation (`/mod`)",
+            value=(
+                "`/mod warn` • `/mod warnings` • `/mod delwarn` • `/mod clearwarns` • `/mod escalation-set`\n"
+                "`/mod timeout` • `/mod untimeout` • `/mod kick` • `/mod ban` • `/mod tempban` • `/mod unban`\n"
+                "`/mod purge` (mit User/Bot/Link/Text-Filter) • `/mod lock` • `/mod unlock` • `/mod slowmode`\n"
+                "`/mod case` • `/mod history` • `/mod embed-send` • `/mod embed-edit`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🤖 AutoMod & 📋 Audit-Logs",
+            value=(
+                "`/automod status` • `/automod toggle` • `/automod punishment` • `/automod badword-add`\n"
+                "`/logs status` • `/logs set-channel` • `/logs ignore-channel`"
+            ),
+            inline=False,
+        )
+        embed.add_field(
+            name="🎉 Community-Extras",
+            value=(
+                "`/giveaway start` / `end` / `reroll` / `list` — Gewinnspiele (auch mit Coin-Preis!)\n"
+                "`/poll` — Live-Umfragen mit Fortschrittsbalken\n"
+                "`/suggest send` / `approve` / `deny` — Vorschlags-System\n"
+                "`/starboard setup` — Hall of Fame ab X ⭐ Reaktionen\n"
+                "`/customcmd add` / `remove` / `list` — Eigene `!<name>` Befehle\n"
+                "`/afk [grund]` — Automatische AFK-Antwort bei Pings"
+            ),
+            inline=False,
+        )
+        return embed
+
     # Default: Übersicht
     embed = discord.Embed(
-        title="📚 Modcheck Bot – Hilfe & Befehlsübersicht",
+        title="📚 Modcheck v3.0 – All-in-One Befehlsübersicht",
         description=(
-            "Willkommen beim **Modcheck Bot**! Wähle unten im Dropdown-Menü eine Kategorie aus, "
-            "um alle zugehörigen Slash-Commands im Detail zu sehen."
+            "Willkommen beim **Modcheck Bot**! Wähle unten im Dropdown-Menü eine Kategorie aus.\n"
+            "💡 **Tipp für Admins:** Mit **`/feature-status`** siehst du alle aktiven/inaktiven Funktionen und weist Kanäle & Rollen direkt per Klick zu — ganz ohne `.env`!"
         ),
         color=COLOR_INFO,
         timestamp=now,
+    )
+    embed.add_field(
+        name="📈 Leveling, 🎂 Birthday & 🔢 Counting",
+        value="MEE6-XP + Import, 24h-Geburtstagsrolle & Counting-Highscores",
+        inline=True,
+    )
+    embed.add_field(
+        name="🎭 Rollen & 👋 Welcome",
+        value="Button/Dropdown-Panels, Reaction-Roles, Auto/Sticky-Role & Stats",
+        inline=True,
+    )
+    embed.add_field(
+        name="🛡️ Mod, AutoMod & 🎉 Community",
+        value="Warns, Tempban, Purge, AutoMod, Logs, Giveaways, Polls & Starboard",
+        inline=True,
     )
     embed.add_field(
         name="📊 Activity & Twitch",
@@ -317,7 +446,7 @@ def _build_help_embed(category: str) -> discord.Embed:
     )
     embed.add_field(
         name="🎵 Musik & Favoriten",
-        value="YouTube, Spotify, ⭐ Favoriten, 🔊 Lautstärke & Live-Radio",
+        value="YouTube, Autoplay v2.0, Spotify, ⭐ Favoriten & Live-Radio",
         inline=True,
     )
     embed.add_field(
@@ -335,7 +464,7 @@ def _build_help_embed(category: str) -> discord.Embed:
         value="Support-Tickets mit Transcript & Temp-Voice mit Gedächtnis",
         inline=True,
     )
-    embed.set_footer(text="Wähle unten eine Kategorie für alle Befehle • Modcheck v2.2")
+    embed.set_footer(text="Wähle unten eine Kategorie für alle Befehle • Modcheck v3.0")
     return embed
 
 
@@ -348,12 +477,15 @@ class HelpCategoryView(discord.ui.View):
         placeholder="📂 Kategorie auswählen...",
         options=[
             discord.SelectOption(label="Übersicht", value="overview", emoji="🏠", description="Startseite aller Module"),
+            discord.SelectOption(label="Leveling, Birthday & Counting", value="level_bday", emoji="📈", description="MEE6-Level + Import, Geburtstage & Counting"),
+            discord.SelectOption(label="Rollen-Panels, Welcome & Stats", value="roles_welcome", emoji="🎭", description="Self-Roles, Auto-Role, Sticky, Join/Boost"),
+            discord.SelectOption(label="Moderation, AutoMod & Community", value="moderation_suite", emoji="🛡️", description="Warns, Purge, Logs, Giveaways, Polls & AFK"),
             discord.SelectOption(label="Activity & Twitch", value="activity", emoji="📊", description="Streaks, Berichte & Abwesenheiten"),
             discord.SelectOption(label="Live-, YouTube- & Mod-Alerts", value="alerts", emoji="🔔", description="Automatische Ankündigungen & Warnungen"),
-            discord.SelectOption(label="Musik, Favoriten & Radio", value="music", emoji="🎵", description="Player, Favoriten, Lautstärke & Radio"),
+            discord.SelectOption(label="Musik, Favoriten & Radio", value="music", emoji="🎵", description="Player, Autoplay v2.0, Favoriten & Radio"),
             discord.SelectOption(label="Casino & Multiplayer", value="casino", emoji="🎰", description="Economy, Solo-Games & PvP"),
             discord.SelectOption(label="Angeln, Jobs & Shop", value="jobs", emoji="🎣", description="Berufe, Upgrades & Kanalpunkte"),
-            discord.SelectOption(label="Tickets, Temp-Voice & Tools", value="community", emoji="🎫", description="Support, Sprachkanäle, Profile & Reminder"),
+            discord.SelectOption(label="Tickets, Temp-Voice & Setup", value="community", emoji="🎫", description="/feature-status, Tickets, Voice & Profile"),
         ],
     )
     async def select_category(self, interaction: discord.Interaction, select: discord.ui.Select) -> None:
@@ -410,7 +542,7 @@ class GeneralCog(commands.Cog, name="General"):
     async def _before_reminder_loop(self) -> None:
         await self.bot.wait_until_ready()
 
-    # ── Events: Message Tracking, Edit/Delete Logs & Member Join ──────────
+    # ── Events: Message Statistik-Tracking ────────────────────────────────
 
     @commands.Cog.listener()
     async def on_message(self, message: discord.Message) -> None:
@@ -422,101 +554,6 @@ class GeneralCog(commands.Cog, name="General"):
                 message.author.display_name,
                 message.channel.id,
             )
-        except Exception:
-            pass
-
-    @commands.Cog.listener()
-    async def on_member_join(self, member: discord.Member) -> None:
-        auto_role_name = str(runtime_settings.get("auto_role_name") or "").strip()
-        if auto_role_name:
-            try:
-                role = discord.utils.get(member.guild.roles, name=auto_role_name)
-                if role:
-                    await member.add_roles(role, reason="Modcheck Auto-Rolle")
-            except Exception as e:
-                print(f"⚠️ Auto-Rolle konnte nicht vergeben werden: {e}")
-
-        now = datetime.datetime.now(datetime.timezone.utc)
-        age_days = max(0, (now - member.created_at).days)
-        suspicious = age_days < 7
-
-        embed = discord.Embed(
-            title="⚠️ Neuer Account beigetreten" if suspicious else "👋 Neues Mitglied",
-            description=f"{member.mention} (`{member.name}`) ist dem Server beigetreten.",
-            color=COLOR_WARNING if suspicious else COLOR_SUCCESS,
-            timestamp=now,
-        )
-        embed.set_thumbnail(url=member.display_avatar.url)
-        embed.add_field(
-            name="📅 Account erstellt",
-            value=f"<t:{int(member.created_at.timestamp())}:R> ({age_days} Tage alt)",
-            inline=True,
-        )
-        embed.add_field(
-            name="👥 Mitgliederzahl",
-            value=f"**{member.guild.member_count}**",
-            inline=True,
-        )
-        await send_log(embed, self.bot)
-
-    @commands.Cog.listener()
-    async def on_message_delete(self, message: discord.Message) -> None:
-        if not message.guild or message.author.bot:
-            return
-        content = (message.content or "").strip()
-        attachments = [a.url for a in message.attachments]
-        if not content and not attachments:
-            return
-
-        target_ch_id = MESSAGE_LOG_CHANNEL_ID
-        if not target_ch_id:
-            return
-        log_ch = message.guild.get_channel(target_ch_id)
-        if not log_ch:
-            return
-
-        embed = discord.Embed(
-            title="🗑️ Nachricht gelöscht",
-            color=COLOR_ERROR,
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
-        )
-        embed.set_author(name=f"{message.author.display_name} ({message.author.name})", icon_url=message.author.display_avatar.url)
-        embed.add_field(name="📍 Kanal", value=message.channel.mention, inline=True)
-        embed.add_field(name="🆔 User-ID", value=f"`{message.author.id}`", inline=True)
-        if content:
-            embed.add_field(name="💬 Inhalt", value=content[:1020], inline=False)
-        if attachments:
-            embed.add_field(name="📎 Anhänge", value="\n".join(attachments)[:1020], inline=False)
-        try:
-            await log_ch.send(embed=embed)
-        except Exception:
-            pass
-
-    @commands.Cog.listener()
-    async def on_message_edit(self, before: discord.Message, after: discord.Message) -> None:
-        if not after.guild or after.author.bot:
-            return
-        if (before.content or "") == (after.content or ""):
-            return
-        if not MESSAGE_LOG_CHANNEL_ID:
-            return
-        log_ch = after.guild.get_channel(MESSAGE_LOG_CHANNEL_ID)
-        if not log_ch:
-            return
-
-        embed = discord.Embed(
-            title="✏️ Nachricht bearbeitet",
-            url=after.jump_url,
-            color=COLOR_WARNING,
-            timestamp=datetime.datetime.now(datetime.timezone.utc),
-        )
-        embed.set_author(name=f"{after.author.display_name} ({after.author.name})", icon_url=after.author.display_avatar.url)
-        embed.add_field(name="📍 Kanal", value=after.channel.mention, inline=True)
-        embed.add_field(name="🔗 Link", value=f"[Zur Nachricht]({after.jump_url})", inline=True)
-        embed.add_field(name="Vorher", value=(before.content or "*leer*")[:1020], inline=False)
-        embed.add_field(name="Nachher", value=(after.content or "*leer*")[:1020], inline=False)
-        try:
-            await log_ch.send(embed=embed)
         except Exception:
             pass
 
@@ -688,6 +725,24 @@ class GeneralCog(commands.Cog, name="General"):
         embed.add_field(name="💬 Nachrichten", value=f"**{msg_total:,}**", inline=True)
         embed.add_field(name="🎙️ Voice-Zeit", value=f"**{vh}h {vm}m**", inline=True)
 
+        if interaction.guild:
+            lvl_snap = get_user_level_snapshot(interaction.guild.id, target.id)
+            rank_disp = f"`#{lvl_snap['rank']}`" if lvl_snap["rank"] else "–"
+            bday_info = get_user_birthday_info(interaction.guild.id, target.id)
+            bday_disp = (
+                f"**{int(bday_info['day']):02d}. {MONTH_NAMES[int(bday_info['month'])]}**"
+                if bday_info
+                else "*Nicht eingetragen*"
+            )
+            embed.add_field(
+                name="⭐ Level & 🎂 Geburtstag",
+                value=(
+                    f"Level: **`{lvl_snap['level']}`** (`{lvl_snap['xp']:,} XP` • Rang {rank_disp})\n"
+                    f"Geburtstag: {bday_disp}"
+                ),
+                inline=False,
+            )
+
         embed.add_field(
             name="🎣 Angeln & Berufe",
             value=(
@@ -832,13 +887,24 @@ class GeneralCog(commands.Cog, name="General"):
         )
 
         voice_h, voice_m = voice_secs // 3600, (voice_secs % 3600) // 60
+        lvl_line = "–"
+        warn_cnt = 0
+        bday_txt = "–"
+        if interaction.guild:
+            ls = get_user_level_snapshot(interaction.guild.id, target.id)
+            lvl_line = f"Lvl. {ls['level']} ({ls['xp']:,} XP)"
+            warn_cnt = get_active_warn_count(interaction.guild.id, target.id)
+            bi = get_user_birthday_info(interaction.guild.id, target.id)
+            if bi:
+                bday_txt = f"{int(bi['day']):02d}.{int(bi['month']):02d}." + (f"{bi['year']}" if bi.get("year") else "")
         embed.add_field(
-            name="📊 Chat, Voice & Coins",
+            name="📊 Level, Chat, Coins & Moderation",
             value="\n".join([
-                f"**Nachrichten:** {voice_msgs:,}",
-                f"**Voice-Zeit:** {voice_h}h {voice_m}m",
-                f"**Coins:** {balance:,} 🪙 (#{coin_rank})",
-                f"**Offene Tickets:** {len(user_tickets)}",
+                f"**Level:** {lvl_line}",
+                f"**Geburtstag:** {bday_txt}",
+                f"**Verwarnungen:** {warn_cnt}",
+                f"**Nachrichten:** {voice_msgs:,} • **Voice:** {voice_h}h {voice_m}m",
+                f"**Coins:** {balance:,} 🪙 (#{coin_rank}) • **Tickets:** {len(user_tickets)}",
             ]),
             inline=True,
         )

@@ -33,6 +33,13 @@ logs/
 user_prefs.json
 alerts_state.json
 runtime_state.json
+server_config.json
+birthdays.json
+counting.json
+levels.json
+roles_config.json
+moderation.json
+community.json
 
 # Node.js (falls du Discord.js oder Frontend-Tools nutzt)
 node_modules/

@@ -21,6 +21,7 @@ from bot_core.config import (
     TICKET_LOG_CHANNEL_ID,
     TICKET_SUPPORT_ROLE,
 )
+from bot_core.server_store import get_dynamic_channel_id
 from bot_core.storage import get_next_ticket_number, load_tickets, open_tickets, save_tickets
 
 
@@ -70,7 +71,10 @@ async def send_ticket_log(
     transcript_bytes: bytes | None = None,
 ) -> None:
     try:
-        log_ch_id = TICKET_LOG_CHANNEL_ID or LOG_CHANNEL_ID
+        log_ch_id = (
+            get_dynamic_channel_id(guild.id, "ticket_log_channel_id", TICKET_LOG_CHANNEL_ID)
+            or get_dynamic_channel_id(guild.id, "log_channel_id", LOG_CHANNEL_ID)
+        )
         if not log_ch_id:
             return
         log_channel = guild.get_channel(log_ch_id)
@@ -202,7 +206,8 @@ class TicketCreateModal(discord.ui.Modal, title="Support-Ticket erstellen"):
         await interaction.response.defer(ephemeral=True)
         ticket_num = get_next_ticket_number()
 
-        category = interaction.guild.get_channel(TICKET_CATEGORY_ID) if TICKET_CATEGORY_ID else None
+        cat_id = get_dynamic_channel_id(interaction.guild.id, "ticket_category_id", TICKET_CATEGORY_ID)
+        category = interaction.guild.get_channel(cat_id) if cat_id else None
         if not isinstance(category, discord.CategoryChannel):
             category = None
 
