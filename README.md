@@ -33,12 +33,21 @@ Ein modularer, extrem ressourcenschonender All-in-One Community-Bot für **Disco
 
 Nach dem Start stehen `/feature-status` (Admin-Setup), `/help` und `/status` zur Verfügung. Im Setup-Center können viele Kanal- und Rollenzuordnungen pro Server ohne Neustart geändert werden; Spezialoptionen liegen in den jeweiligen Befehlsgruppen:
 
+**Setup-Center bedienen:** Bereich wählen → Funktion wählen → Einstellung auswählen → Kanal oder Rolle auswählen. Bei Funktionen mit nur einer Einstellung erscheint die Auswahl direkt. Der aktuelle Wert und ggf. ein An-/Aus-Schalter stehen auf der Funktionsseite. Eine Kanalwahl allein aktiviert die Funktion nicht automatisch. Über „Auswahl zurücksetzen“ wird die Auswahl entfernt bzw. der angezeigte Fallback verwendet; Auto-Rollen können dort hinzugefügt oder alle zusammen entfernt werden. Weitere Optionen und Funktionen ohne feste Kanal-/Rollenbindung sind mit den passenden Slash-Befehlen aufgeführt. Twitch-/YouTube-Alerts werden weiterhin botweit gespeichert und sind entsprechend gekennzeichnet.
+
+
 - `/birthday`: Geburtstage und Tagesrolle; der 29. Februar wird in Nicht-Schaltjahren am 28. Februar gefeiert.
 - `/counting`: Zählkanal, Wechsel der Teilnehmer und Highscore.
 - `/rank` und `/levels`: Chat-/Voice-XP, Levelrollen, Coin-Boni und MEE6-Import. Das Leaderboard muss für den direkten MEE6-Abruf erreichbar sein. Alternativ `python tools/export_mee6.py SERVER_ID` ausführen und die JSON-Datei mit `/levels import-mee6` hochladen. Der tatsächliche Zugriff hängt von MEE6 und dessen API ab.
 - `/roles` und `/welcome`: Rollenpanels, Reaction-/Auto-/Sticky-Rollen, Begrüßungen, Boosts und Statistikkanäle.
 - `/mod`, `/automod` und `/logs`: Moderationsfälle, konfigurierbare Filter und Audit-Kanäle. Automatische Warn-Eskalationen müssen ausdrücklich eingerichtet werden.
 - `/giveaway`, `/poll`, `/suggest`, `/starboard`, `/customcmd` und `/afk`: Community-Funktionen.
+
+### Statistik-Kanäle direkt im Menü
+
+`/feature-status` → **Server & Rollen** → **Statistik-Zähler** → **Zähler erstellen**: Typ auswählen, optional eine Kategorie und einen eigenen Namen mit `{count}` festlegen, dann **Kanal erstellen**. Der Bot legt einen nicht beitretbaren Sprachkanal an. Zur Auswahl stehen unter anderem Discord-Mitglieder (mit oder ohne Bots) und Twitch-Follower. Unter **Zähler verwalten** können angelegte Zähler nach Bestätigung wieder gelöscht werden. Pro Typ wird ein vorhandener Zähler nicht doppelt erstellt. Alternativ bieten `/welcome counter-create` und `/welcome counter-remove` dieselben Funktionen.
+
+Die Aktualisierung erfolgt ungefähr alle 10 Minuten; der letzte Wert bleibt bei einem Twitch-Fehler erhalten. Für Twitch wird der konfigurierte `STREAMER_CHANNEL` oder `STREAMER_USER_ID` sowie `TWITCH_CLIENT_ID` und ein gültiges App- oder Benutzer-Token benötigt (z. B. App-Token über `TWITCH_CLIENT_SECRET`). Twitch muss den Zugriff erlauben. Falls der erste Abruf fehlschlägt, wird kein Kanal erstellt und das Menü zeigt einen Hinweis. Der Bot benötigt außerdem **Kanäle verwalten** in der gewählten Kategorie.
 
 Im Discord Developer Portal **Server Members Intent** und **Message Content Intent** aktivieren; für Online-Zähler zusätzlich **Presence Intent**. Der Bot benötigt die jeweils passenden Kanal-, Nachrichten-, Rollen- und Moderationsrechte, und seine höchste Rolle muss über Rollen bzw. Mitgliedern stehen, die er verwalten soll. Persistente Rollen-, Giveaway- und Umfrage-Buttons funktionieren nach Neustarts weiter.
 

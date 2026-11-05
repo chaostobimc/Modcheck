@@ -345,7 +345,7 @@ class RedeemSelectView(discord.ui.View):
         log_embed.add_field(name="🟣 Twitch", value=f"`{t_name}`", inline=True)
         log_embed.add_field(name="💰 Bezahlt", value=f"`{cost:,} 🪙`", inline=True)
         log_embed.add_field(name="🏆 Belohnung", value=f"**{reward['title']}**", inline=False)
-        await send_log(log_embed, self.bot)
+        await send_log(log_embed, self.bot, interaction.guild_id)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -35,6 +35,7 @@ from bot_core.config import (
     now_berlin,
     today_berlin,
 )
+from bot_core.server_store import get_dynamic_channel_id
 from bot_core.stats import stats_tracker
 from bot_core.storage import load_data, save_data
 
@@ -318,6 +319,44 @@ async def resolve_broadcaster_id() -> str | None:
     return None
 
 
+async def fetch_twitch_follower_count() -> int | None:
+    """Liest ausschließlich die öffentliche Gesamtzahl; None bedeutet nicht verfügbar.
+
+    Twitch kann je nach Token/Client den Abruf ablehnen. Keine Antwort wird als 0
+    interpretiert und es werden keine Followernamen abgefragt oder gespeichert.
+    """
+    if not TWITCH_CLIENT_ID:
+        return None
+    broadcaster_id = await resolve_broadcaster_id()
+    if not broadcaster_id:
+        return None
+    app_token = await get_twitch_app_token()
+    tokens = list(dict.fromkeys(
+        token for token in (app_token, STREAMER_OAUTH_TOKEN, TWITCH_TOKEN)
+        if token
+    ))
+    if not tokens:
+        return None
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=10)) as session:
+            for token in tokens:
+                async with session.get(
+                    "https://api.twitch.tv/helix/channels/followers",
+                    params={"broadcaster_id": broadcaster_id, "first": 1},
+                    headers={"Client-ID": TWITCH_CLIENT_ID,
+                             "Authorization": f"Bearer {token.removeprefix('oauth:')}"},
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        total = data.get("total") if isinstance(data, dict) else None
+                        return total if type(total) is int and total >= 0 else None
+                    if resp.status not in (401, 403):
+                        return None
+    except (aiohttp.ClientError, asyncio.TimeoutError, ValueError, TypeError):
+        return None
+    return None
+
+
 _streamer_profile_cache: dict[str, Any] = {"data": None, "fetched_at": 0.0}
 
 
@@ -455,7 +494,7 @@ class TwitchBot(t_commands.Bot):
         deleted_msg: str | None = None,
     ) -> None:
         stats_tracker.add_mod_action(action, target, moderator, reason, duration)
-        if not TWITCH_LOG_CHANNEL_ID or not self.discord_bot:
+        if not self.discord_bot:
             return
         embed = build_twitch_mod_embed(
             action=action,
@@ -469,14 +508,14 @@ class TwitchBot(t_commands.Bot):
         loop = self.discord_bot.loop
         if loop and loop.is_running():
             async def _post() -> None:
-                ch = self.discord_bot.get_channel(TWITCH_LOG_CHANNEL_ID)
-                if ch is None:
-                    try:
-                        ch = await self.discord_bot.fetch_channel(TWITCH_LOG_CHANNEL_ID)
-                    except Exception:
-                        return
-                if ch:
-                    await ch.send(embed=embed)
+                for guild in self.discord_bot.guilds:
+                    channel_id = get_dynamic_channel_id(guild.id, "twitch_log_channel_id", TWITCH_LOG_CHANNEL_ID)
+                    ch = guild.get_channel(channel_id) if channel_id else None
+                    if ch:
+                        try:
+                            await ch.send(embed=embed)
+                        except discord.HTTPException as exc:
+                            print(f"⚠️ [Twitch] Mod-Log konnte nicht gesendet werden: {exc}")
 
             asyncio.run_coroutine_threadsafe(_post(), loop)
 

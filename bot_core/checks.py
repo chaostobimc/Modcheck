@@ -123,7 +123,8 @@ async def send_log(embed: discord.Embed, bot: discord.Client, guild_id: int | No
     gid = int(guild_id or GUILD_ID or 0)
     cfg_logs = server_cfg_store.get_guild(gid).get("logs", {}) if gid else {}
     target_id = (
-        int(cfg_logs.get("mod_log_channel_id") or 0)
+        int((cfg_logs.get("mod") or {}).get("channel_id") or 0)
+        or int(cfg_logs.get("mod_log_channel_id") or 0)
         or get_dynamic_channel_id(gid, "log_channel_id", LOG_CHANNEL_ID)
     )
     if not target_id:

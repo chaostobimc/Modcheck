@@ -21,14 +21,19 @@ from bot_core.config import (
     TICKET_LOG_CHANNEL_ID,
     TICKET_SUPPORT_ROLE,
 )
-from bot_core.server_store import get_dynamic_channel_id
+from bot_core.server_store import get_dynamic_channel_id, get_dynamic_role_id
 from bot_core.storage import get_next_ticket_number, load_tickets, open_tickets, save_tickets
+
+
+def _support_role(guild: discord.Guild) -> discord.Role | None:
+    role_id = get_dynamic_role_id(guild.id, "ticket_support_role_id")
+    return guild.get_role(role_id) if role_id else discord.utils.get(guild.roles, name=TICKET_SUPPORT_ROLE)
 
 
 def _is_support(member: discord.Member) -> bool:
     if is_user_admin(member):
         return True
-    role = discord.utils.get(member.guild.roles, name=TICKET_SUPPORT_ROLE)
+    role = _support_role(member.guild)
     if role and role in member.roles:
         return True
     return member.guild_permissions.manage_channels
@@ -228,7 +233,7 @@ class TicketCreateModal(discord.ui.Modal, title="Support-Ticket erstellen"):
                 read_message_history=True,
             ),
         }
-        support_role = discord.utils.get(interaction.guild.roles, name=TICKET_SUPPORT_ROLE)
+        support_role = _support_role(interaction.guild)
         if support_role:
             overwrites[support_role] = discord.PermissionOverwrite(
                 view_channel=True,
@@ -311,7 +316,7 @@ class TicketControlView(discord.ui.View):
             return
         if not _is_support(interaction.user):
             await interaction.response.send_message(
-                f"❌ Nur **{TICKET_SUPPORT_ROLE}** kann Tickets übernehmen!", ephemeral=True
+                f"❌ Nur das Support-Team kann Tickets übernehmen!", ephemeral=True
             )
             return
 
@@ -424,7 +429,7 @@ class TicketsCog(commands.Cog, name="Tickets"):
             return
         if not _is_support(interaction.user):
             await interaction.response.send_message(
-                f"❌ Nur **{TICKET_SUPPORT_ROLE}** kann User hinzufügen!", ephemeral=True
+                f"❌ Nur das Support-Team kann User hinzufügen!", ephemeral=True
             )
             return
         channel = interaction.guild.get_channel(interaction.channel_id)
@@ -450,7 +455,7 @@ class TicketsCog(commands.Cog, name="Tickets"):
             return
         if not _is_support(interaction.user):
             await interaction.response.send_message(
-                f"❌ Nur **{TICKET_SUPPORT_ROLE}** kann User entfernen!", ephemeral=True
+                f"❌ Nur das Support-Team kann User entfernen!", ephemeral=True
             )
             return
         if member.id == ticket.get("user_id"):
@@ -474,7 +479,7 @@ class TicketsCog(commands.Cog, name="Tickets"):
             return
         if not _is_support(interaction.user):
             await interaction.response.send_message(
-                f"❌ Nur **{TICKET_SUPPORT_ROLE}** kann alle Tickets einsehen!", ephemeral=True
+                f"❌ Nur das Support-Team kann alle Tickets einsehen!", ephemeral=True
             )
             return
 

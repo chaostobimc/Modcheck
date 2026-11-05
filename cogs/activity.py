@@ -454,7 +454,12 @@ class ActivityCog(commands.Cog, name="Activity"):
 
     @tasks.loop(minutes=2)
     async def clip_tracker(self) -> None:
-        if not CLIPS_CHANNEL_ID or not STREAMER_CHANNEL:
+        if not STREAMER_CHANNEL:
+            return
+        targets = [(guild, get_dynamic_channel_id(guild.id, "clips_channel_id", CLIPS_CHANNEL_ID))
+                   for guild in self.bot.guilds]
+        targets = [(guild, channel_id) for guild, channel_id in targets if channel_id]
+        if not targets:
             return
         clips = await fetch_recent_clips(limit=20)
         if not clips:
@@ -504,14 +509,13 @@ class ActivityCog(commands.Cog, name="Activity"):
                 embed.set_image(url=thumb)
             embed.set_footer(text=f"Twitch Clips • {STREAMER_CHANNEL}")
 
-            for guild in self.bot.guilds:
-                ch = guild.get_channel(CLIPS_CHANNEL_ID)
+            for guild, channel_id in targets:
+                ch = guild.get_channel(channel_id)
                 if ch:
                     try:
                         await ch.send(content=f"🎬 **Neuer Clip!** [{clip_title}]({clip_url})", embed=embed)
                     except Exception as e:
                         print(f"⚠️ [ClipTracker] Senden fehlgeschlagen: {e}")
-                    break
 
     @clip_tracker.before_loop
     async def _before_clips(self) -> None:
@@ -984,7 +988,7 @@ class ActivityCog(commands.Cog, name="Activity"):
         log_embed.add_field(name="👤 User", value=interaction.user.mention, inline=True)
         log_embed.add_field(name="📅 Zeitraum", value=period_label, inline=True)
         log_embed.add_field(name="📝 Grund", value=grund, inline=False)
-        await send_log(log_embed, self.bot)
+        await send_log(log_embed, self.bot, interaction.guild_id)
 
     @app_commands.command(name="unabsent", description="📋 Entferne eine Abwesenheitsmeldung")
     @app_commands.describe(datum="Datum der Abwesenheit (heute, morgen oder TT.MM.JJJJ) — leer = heute")

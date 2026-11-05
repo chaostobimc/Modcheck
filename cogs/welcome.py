@@ -1,6 +1,7 @@
 """Welcome & Server-Stats Cog: Begrüßung, DM, Goodbye, Server-Boost-Belohnung & Live-Voice-Counter."""
 from __future__ import annotations
 
+import asyncio
 import datetime
 from typing import Any
 
@@ -18,6 +19,22 @@ from bot_core.config import (
 )
 from bot_core.server_store import get_dynamic_channel_id, server_cfg_store
 from bot_core.storage import update_balance
+from bot_core.twitch_service import fetch_twitch_follower_count
+
+
+STAT_COUNTERS = {
+    "all": ("Discord Mitglieder (inkl. Bots)", "👥 Discord Mitglieder: {count}"),
+    "members": ("Discord Mitglieder (ohne Bots)", "👥 Mitglieder: {count}"),
+    "twitch_followers": ("Twitch Follower", "🟣 Twitch Follower: {count}"),
+    "bots": ("Discord Bots", "🤖 Bots: {count}"),
+    "boosts": ("Discord Boosts", "💎 Boosts: {count}"),
+    "online": ("Discord Online-Mitglieder", "🟢 Online: {count}"),
+}
+
+
+class CounterSetupError(Exception):
+    """Sichere, nutzerverständliche Fehlermeldung bei der Zähler-Einrichtung."""
+
 
 
 def _format_welcome_text(template: str, member: discord.Member) -> str:
@@ -179,81 +196,47 @@ class WelcomeGroup(app_commands.Group):
 
     @app_commands.command(
         name="counter-create",
-        description="📊 Erstellt einen gesperrten Statistik-Sprachkanal oben im Server (ProBot/MEE6 Stil)",
+        description="📊 Erstellt einen Statistik-Sprachkanal (Admins)",
     )
     @app_commands.choices(
-        typ=[
-            app_commands.Choice(name="👥 Mitglieder (ohne Bots)", value="members"),
-            app_commands.Choice(name="🌐 Alle Mitglieder (inkl. Bots)", value="all"),
-            app_commands.Choice(name="🤖 Bots", value="bots"),
-            app_commands.Choice(name="💎 Server-Boosts", value="boosts"),
-            app_commands.Choice(name="🟢 Online-Mitglieder", value="online"),
-        ]
+        typ=[app_commands.Choice(name=label, value=key) for key, (label, _) in STAT_COUNTERS.items()]
     )
     @app_commands.describe(
-        typ="Welche Zahl soll live gezählt werden?",
-        vorlage="Kanalname mit {count} als Platzhalter (z. B. '👥 Mitglieder: {count}')",
+        typ="Welche Zahl soll angezeigt werden?",
+        vorlage="Kanalname mit {count} als Platzhalter",
+        kategorie="Optionale Kategorie für den neuen Kanal",
     )
     async def cmd_counter_create(
-        self, interaction: discord.Interaction, typ: str, vorlage: str | None = None
+        self, interaction: discord.Interaction, typ: str, vorlage: str | None = None,
+        kategorie: discord.CategoryChannel | None = None,
     ) -> None:
         if not is_user_admin(interaction.user) or not interaction.guild:
             await interaction.response.send_message("❌ Nur für Administratoren.", ephemeral=True)
             return
-        defaults = {
-            "members": "👥 Mitglieder: {count}",
-            "all": "🌐 Gesamt: {count}",
-            "bots": "🤖 Bots: {count}",
-            "boosts": "💎 Boosts: {count}",
-            "online": "🟢 Online: {count}",
-        }
-        tpl = vorlage if (vorlage and "{count}" in vorlage) else defaults.get(typ, "📊 {count}")
-        val = self.cog.compute_stat_value(interaction.guild, typ)
-        overwrites = {
-            interaction.guild.default_role: discord.PermissionOverwrite(connect=False, view_channel=True)
-        }
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            vc = await interaction.guild.create_voice_channel(
-                name=tpl.replace("{count}", str(val)),
-                overwrites=overwrites,
-                reason="Modcheck Server-Stats Counter",
-            )
-        except discord.Forbidden:
-            await interaction.response.send_message(
-                "❌ Mir fehlt die Berechtigung `Kanäle verwalten`.", ephemeral=True
-            )
+            channel = await self.cog.create_stat_counter(interaction.guild, typ, kategorie, vorlage)
+        except CounterSetupError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
             return
-
-        server_cfg_store.mutate(
-            interaction.guild.id,
-            lambda g: g.setdefault("stats_channels", []).append(
-                {"channel_id": vc.id, "type": typ, "template": tpl}
-            ),
-        )
-        await interaction.response.send_message(
-            f"✅ Statistik-Kanal {vc.mention} erstellt (aktualisiert sich alle 10 Min. automatisch).",
-            ephemeral=True,
+        await interaction.followup.send(
+            f"✅ Statistik-Kanal {channel.mention} erstellt. Aktualisierung etwa alle 10 Minuten.", ephemeral=True
         )
 
-    @app_commands.command(name="counter-remove", description="🗑️ Entfernt einen Statistik-Sprachkanal (Admins)")
+    @app_commands.command(name="counter-remove", description="🗑️ Entfernt einen verwalteten Statistik-Sprachkanal (Admins)")
     async def cmd_counter_remove(
         self, interaction: discord.Interaction, kanal: discord.VoiceChannel
     ) -> None:
         if not is_user_admin(interaction.user) or not interaction.guild:
             await interaction.response.send_message("❌ Nur für Administratoren.", ephemeral=True)
             return
-        server_cfg_store.mutate(
-            interaction.guild.id,
-            lambda g: g.__setitem__(
-                "stats_channels",
-                [c for c in (g.get("stats_channels") or []) if int(c.get("channel_id") or 0) != kanal.id],
-            ),
-        )
+        await interaction.response.defer(ephemeral=True, thinking=True)
         try:
-            await kanal.delete(reason="Statistik-Kanal entfernt")
-        except Exception:
-            pass
-        await interaction.response.send_message("🗑️ Statistik-Kanal entfernt.", ephemeral=True)
+            await self.cog.remove_stat_counter(interaction.guild, kanal.id)
+        except CounterSetupError as exc:
+            await interaction.followup.send(f"❌ {exc}", ephemeral=True)
+            return
+        await interaction.followup.send("🗑️ Statistik-Kanal entfernt.", ephemeral=True)
 
 
 class WelcomeCog(commands.Cog, name="Welcome"):
@@ -261,6 +244,7 @@ class WelcomeCog(commands.Cog, name="Welcome"):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self._counter_locks: dict[int, asyncio.Lock] = {}
         self.welcome_group = WelcomeGroup(self)
         self.bot.tree.add_command(self.welcome_group)
 
@@ -282,6 +266,77 @@ class WelcomeCog(commands.Cog, name="Welcome"):
         if stat_type == "online":
             return sum(1 for m in guild.members if not m.bot and m.status != discord.Status.offline)
         return sum(1 for m in guild.members if not m.bot)
+
+    async def create_stat_counter(
+        self, guild: discord.Guild, stat_type: str,
+        category: discord.CategoryChannel | None = None, template: str | None = None,
+    ) -> discord.VoiceChannel:
+        if stat_type not in STAT_COUNTERS:
+            raise CounterSetupError("Unbekannter Statistik-Typ.")
+        if template is not None and ("{count}" not in template or len(template) > 100):
+            raise CounterSetupError("Die Vorlage muss {count} enthalten und höchstens 100 Zeichen lang sein.")
+        tpl = template or STAT_COUNTERS[stat_type][1]
+        lock = self._counter_locks.setdefault(guild.id, asyncio.Lock())
+        async with lock:
+            counters = server_cfg_store.get_guild(guild.id).get("stats_channels") or []
+            if any(c.get("type") == stat_type and guild.get_channel(int(c.get("channel_id") or 0)) for c in counters):
+                raise CounterSetupError("Für diesen Typ existiert bereits ein Statistik-Kanal. Entferne ihn zuerst, wenn du ihn neu erstellen möchtest.")
+            if stat_type == "twitch_followers":
+                value = await fetch_twitch_follower_count()
+                if value is None:
+                    raise CounterSetupError(
+                        "Twitch-Followerzahl nicht abrufbar. Prüfe STREAMER_CHANNEL bzw. STREAMER_USER_ID, "
+                        "TWITCH_CLIENT_ID und ein gültiges Twitch-Token bzw. TWITCH_CLIENT_SECRET. "
+                        "Der Kanal wurde nicht erstellt; versuche es erneut."
+                    )
+            else:
+                value = self.compute_stat_value(guild, stat_type)
+            try:
+                channel = await guild.create_voice_channel(
+                    name=tpl.replace("{count}", str(value))[:100], category=category,
+                    overwrites={guild.default_role: discord.PermissionOverwrite(connect=False, view_channel=True)},
+                    reason="Modcheck Statistik-Zähler",
+                )
+            except discord.Forbidden as exc:
+                raise CounterSetupError("Mir fehlt die Berechtigung, in dieser Kategorie Kanäle zu verwalten.") from exc
+            except discord.HTTPException as exc:
+                raise CounterSetupError("Discord konnte den Statistik-Kanal nicht erstellen.") from exc
+            try:
+                server_cfg_store.mutate(guild.id, lambda g: g.setdefault("stats_channels", []).append(
+                    {"channel_id": channel.id, "type": stat_type, "template": tpl}
+                ))
+            except Exception as exc:
+                try:
+                    await channel.delete(reason="Statistik-Zähler konnte nicht gespeichert werden")
+                except discord.HTTPException:
+                    raise CounterSetupError(
+                        f"Der Zähler konnte nicht gespeichert oder automatisch gelöscht werden. Bitte entferne {channel.mention} manuell und prüfe die Bot-Logs."
+                    ) from exc
+                raise CounterSetupError("Der Kanal konnte nicht gespeichert werden und wurde wieder entfernt. Bitte prüfe die Bot-Logs.") from exc
+            return channel
+
+    async def remove_stat_counter(self, guild: discord.Guild, channel_id: int) -> None:
+        lock = self._counter_locks.setdefault(guild.id, asyncio.Lock())
+        async with lock:
+            counters = server_cfg_store.get_guild(guild.id).get("stats_channels") or []
+            if not any(int(c.get("channel_id") or 0) == channel_id for c in counters):
+                raise CounterSetupError("Dieser Kanal ist kein verwalteter Statistik-Kanal.")
+            channel = guild.get_channel(channel_id)
+            if channel is not None:
+                try:
+                    await channel.delete(reason="Modcheck Statistik-Kanal entfernt")
+                except discord.NotFound:
+                    pass
+                except discord.Forbidden as exc:
+                    raise CounterSetupError("Mir fehlt die Berechtigung, diesen Kanal zu löschen.") from exc
+                except discord.HTTPException as exc:
+                    raise CounterSetupError("Discord konnte den Kanal nicht löschen. Bitte erneut versuchen.") from exc
+            try:
+                server_cfg_store.mutate(guild.id, lambda g: g.__setitem__("stats_channels", [
+                    c for c in (g.get("stats_channels") or []) if int(c.get("channel_id") or 0) != channel_id
+                ]))
+            except Exception as exc:
+                raise CounterSetupError("Der Kanal wurde entfernt, aber die Statistik-Einstellung konnte nicht gespeichert werden. Bitte erneut versuchen und die Bot-Logs prüfen.") from exc
 
     async def send_welcome(
         self,
@@ -409,21 +464,30 @@ class WelcomeCog(commands.Cog, name="Welcome"):
 
     @tasks.loop(minutes=10)
     async def stats_counter_loop(self) -> None:
-        for guild in list(self.bot.guilds):
-            g = server_cfg_store.get_guild(guild.id)
-            counters = g.get("stats_channels") or []
+        guilds = list(self.bot.guilds)
+        configs = [(guild, server_cfg_store.get_guild(guild.id).get("stats_channels") or []) for guild in guilds]
+        needs_twitch = any(item.get("type") == "twitch_followers" for _, items in configs for item in items)
+        # Ein API-Abruf für alle Server; bei Fehlern bleibt der letzte Kanalname erhalten.
+        followers = await fetch_twitch_follower_count() if needs_twitch else None
+        for guild, counters in configs:
             for item in counters:
                 cid = int(item.get("channel_id") or 0)
                 vc = guild.get_channel(cid)
                 if not isinstance(vc, discord.VoiceChannel):
                     continue
-                val = self.compute_stat_value(guild, str(item.get("type") or "members"))
+                stat_type = str(item.get("type") or "members")
+                if stat_type == "twitch_followers":
+                    if followers is None:
+                        continue
+                    val = followers
+                else:
+                    val = self.compute_stat_value(guild, stat_type)
                 desired = str(item.get("template") or "👥 {count}").replace("{count}", str(val))
                 if vc.name != desired:
                     try:
                         await vc.edit(name=desired[:100])
-                    except Exception:
-                        pass
+                    except discord.HTTPException as exc:
+                        print(f"⚠️ [Statistik] Kanal {cid} konnte nicht aktualisiert werden: {exc}")
 
     @stats_counter_loop.before_loop
     async def _before_stats_loop(self) -> None:

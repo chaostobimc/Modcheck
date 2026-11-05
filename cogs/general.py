@@ -617,8 +617,13 @@ class GeneralCog(commands.Cog, name="General"):
         today_s = str(today_berlin())
         today_count = len(data["streams"].get(today_s, []))
 
+        review_channel_id = get_dynamic_channel_id(interaction.guild_id, "review_channel_id", REVIEW_CHANNEL_ID)
+        temp_voice_channel_id = get_dynamic_channel_id(interaction.guild_id, "temp_voice_channel_id", TEMP_VOICE_CHANNEL_ID)
+        twitch_log_channel_id = get_dynamic_channel_id(interaction.guild_id, "twitch_log_channel_id", TWITCH_LOG_CHANNEL_ID)
+        gambling_channel_id = get_dynamic_channel_id(interaction.guild_id, "gambling_channel_id", GAMBLING_CHANNEL_ID)
+        fishing_channel_id = get_dynamic_channel_id(interaction.guild_id, "fishing_channel_id", FISHING_CHANNEL_ID)
         next_review = "Deaktiviert"
-        if REVIEW_CHANNEL_ID:
+        if review_channel_id:
             now_de = now_berlin()
             td = now_de.date()
             last_day = calendar.monthrange(td.year, td.month)[1]
@@ -661,11 +666,11 @@ class GeneralCog(commands.Cog, name="General"):
                 f"Twitch Live-Post  {'✅ Aktiv' if alerts_cfg.get('live_channel_id') else '❌ Nicht gesetzt (/setlivealert)'}\n"
                 f"YouTube-Alerts ── {'✅ Aktiv' if alerts_cfg.get('yt_channel_id_discord') else '❌ Nicht gesetzt (/setyoutubealert)'}\n"
                 f"Inaktivitäts-Warn {'✅ Aktiv (ab ' + str(alerts_cfg.get('inactivity_threshold', 5)) + ' Streams)' if alerts_cfg.get('inactivity_enabled', True) else '⏸️ Pausiert'}\n"
-                f"Twitch Mod Log ── {'✅ Aktiv' if TWITCH_LOG_CHANNEL_ID else '❌ Deaktiviert'}\n"
+                f"Twitch Mod Log ── {'✅ Aktiv' if twitch_log_channel_id else '❌ Deaktiviert'}\n"
                 f"Musik & Radio ─── {'✅ Aktiv (' + str(active_music) + ' Streams)' if MUSIC_ENABLED else '❌ Deaktiviert'}\n"
-                f"Temp Voice ────── {'✅ Aktiv (' + str(active_tempvcs) + ' Kanäle)' if TEMP_VOICE_CHANNEL_ID else '❌ Deaktiviert'}\n"
+                f"Temp Voice ────── {'✅ Aktiv (' + str(active_tempvcs) + ' Kanäle)' if temp_voice_channel_id else '❌ Deaktiviert'}\n"
                 f"Support-Tickets ─ ✅ `{len(open_tickets)}` offen\n"
-                f"Monthly Review ── {'✅ Aktiv' if REVIEW_CHANNEL_ID else '❌ Deaktiviert'}"
+                f"Monthly Review ── {'✅ Aktiv' if review_channel_id else '❌ Deaktiviert'}"
             ),
             inline=False,
         )
@@ -679,8 +684,8 @@ class GeneralCog(commands.Cog, name="General"):
         embed.add_field(
             name="🎰 Kanäle",
             value=(
-                f"Casino: {'<#' + str(GAMBLING_CHANNEL_ID) + '>' if GAMBLING_CHANNEL_ID else 'Überall'} • "
-                f"Angeln/Jobs: {'<#' + str(FISHING_CHANNEL_ID) + '>' if FISHING_CHANNEL_ID else 'Überall'}"
+                f"Casino: {'<#' + str(gambling_channel_id) + '>' if gambling_channel_id else 'Überall'} • "
+                f"Angeln/Jobs: {'<#' + str(fishing_channel_id) + '>' if fishing_channel_id else 'Überall'}"
             ),
             inline=False,
         )
@@ -920,8 +925,9 @@ class GeneralCog(commands.Cog, name="General"):
         )
         embed.set_footer(text=f"Angefordert von {interaction.user.display_name}")
 
-        if USERINFO_CHANNEL_ID and interaction.guild:
-            archive_ch = interaction.guild.get_channel(USERINFO_CHANNEL_ID)
+        archive_id = get_dynamic_channel_id(interaction.guild_id, "userinfo_channel_id", USERINFO_CHANNEL_ID)
+        if archive_id and interaction.guild:
+            archive_ch = interaction.guild.get_channel(archive_id)
             if archive_ch:
                 try:
                     await archive_ch.send(embed=embed)
